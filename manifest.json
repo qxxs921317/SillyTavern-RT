@@ -1,12 +1,12 @@
 {
-    "display_name": "Lorebook Translator",
+    "display_name": "🍒 Cherry&Solti Lorebook Translator",
     "loading_order": 10,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "Jinhee",
-    "version": "0.1.0",
+    "author": "Cherry",
+    "version": "0.3.0",
     "homePage": "",
-    "auto_update": false
+    "auto_update": true
 }

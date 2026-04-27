@@ -2,9 +2,10 @@ import { extension_settings, getContext } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const EXT_ID = 'lorebook-translator';
-const EXT_NAME = 'Lorebook Translator';
+const EXT_NAME = 'Cherry&Solti Lorebook Translator';
+const EXT_TAG = 'CSLT'; // for console logs
 
-console.log(`[${EXT_NAME}] script file loaded`);
+console.log(`[${EXT_TAG}] script file loaded`);
 
 const defaultSettings = {
     profileId: '',
@@ -12,11 +13,23 @@ const defaultSettings = {
     targetLang: '한국어',
     autoAddKoreanKeys: true,
     maxTokens: 8192,
+    bulkSkipTranslated: true,
+    bulkDelayMs: 500,
 };
 
 let appReady = false;
 let observerActive = false;
 let scopedObserver = null;
+
+// Bulk translation state
+let bulkState = {
+    running: false,
+    paused: false,
+    cancelled: false,
+    total: 0,
+    done: 0,
+    failed: 0,
+};
 
 function getSettings() {
     if (!extension_settings[EXT_ID]) {
@@ -49,7 +62,7 @@ async function resolveCMRS() {
             return mod.ConnectionManagerRequestService;
         }
     } catch (e) {
-        console.warn(`[${EXT_NAME}] CMRS import failed:`, e?.message);
+        console.warn(`[${EXT_TAG}] CMRS import failed:`, e?.message);
     }
     return null;
 }
@@ -62,6 +75,11 @@ function debounce(fn, ms) {
     };
 }
 
+function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
+// ---------- Settings UI ----------
 function renderSettings() {
     const settings = getSettings();
     const profiles = getConnectionProfiles();
@@ -71,39 +89,52 @@ function renderSettings() {
         .join('');
 
     const html = `
-    <div class="lbt-settings">
+    <div class="cslt-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>📖 Lorebook Translator</b>
+          <b>🍒 Cherry&Solti Lorebook Translator</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
 
-          <label for="lbt-profile">연결 프로필 (Connection Profile)</label>
-          <select id="lbt-profile" class="text_pole">
+          <label for="cslt-profile">연결 프로필 (Connection Profile)</label>
+          <select id="cslt-profile" class="text_pole">
             <option value="">— 선택 —</option>
             ${profileOptions}
           </select>
           <small style="opacity:.7;">프로필이 안 보이면 Connection Manager에서 먼저 만들어주세요.</small>
 
-          <label for="lbt-unit" style="margin-top:10px;">번역 단위</label>
-          <select id="lbt-unit" class="text_pole">
+          <label for="cslt-unit" style="margin-top:10px;">번역 단위</label>
+          <select id="cslt-unit" class="text_pole">
             <option value="all"     ${settings.translateUnit === 'all' ? 'selected' : ''}>항목 전체 (키워드 + 본문)</option>
             <option value="keys"    ${settings.translateUnit === 'keys' ? 'selected' : ''}>키워드만</option>
             <option value="content" ${settings.translateUnit === 'content' ? 'selected' : ''}>본문만</option>
           </select>
 
-          <label for="lbt-target" style="margin-top:10px;">번역 대상 언어</label>
-          <input id="lbt-target" type="text" class="text_pole" value="${settings.targetLang}">
+          <label for="cslt-target" style="margin-top:10px;">번역 대상 언어</label>
+          <input id="cslt-target" type="text" class="text_pole" value="${settings.targetLang}">
 
-          <label for="lbt-maxtokens" style="margin-top:10px;">최대 응답 토큰 (max output tokens)</label>
-          <input id="lbt-maxtokens" type="number" class="text_pole" min="512" max="32768" step="512" value="${settings.maxTokens}">
-          <small style="opacity:.7;">긴 로어북은 8192 이상 권장. 응답이 잘리면 더 늘리세요.</small>
+          <label for="cslt-maxtokens" style="margin-top:10px;">최대 응답 토큰</label>
+          <input id="cslt-maxtokens" type="number" class="text_pole" min="512" max="32768" step="512" value="${settings.maxTokens}">
+          <small style="opacity:.7;">긴 항목은 8192 이상 권장. 응답이 잘리면 더 늘리세요.</small>
 
           <label class="checkbox_label" style="margin-top:10px;">
-            <input id="lbt-autoadd" type="checkbox" ${settings.autoAddKoreanKeys ? 'checked' : ''}>
+            <input id="cslt-autoadd" type="checkbox" ${settings.autoAddKoreanKeys ? 'checked' : ''}>
             <span>키워드 번역 결과를 자동으로 keys에 추가</span>
           </label>
+
+          <hr style="margin: 12px 0; opacity: .3;">
+
+          <b style="display:block; margin-bottom:6px;">전체 번역 옵션</b>
+
+          <label class="checkbox_label">
+            <input id="cslt-bulk-skip" type="checkbox" ${settings.bulkSkipTranslated ? 'checked' : ''}>
+            <span>이미 번역된 항목은 건너뛰기</span>
+          </label>
+
+          <label for="cslt-bulk-delay" style="margin-top:6px;">호출 간격 (ms)</label>
+          <input id="cslt-bulk-delay" type="number" class="text_pole" min="0" max="10000" step="100" value="${settings.bulkDelayMs}">
+          <small style="opacity:.7;">레이트 리밋 방지용. Flash는 보통 500ms 정도로 충분.</small>
 
           <small style="opacity:.7; display:block; margin-top:8px;">
             본문 번역은 항목 아래 패널에 표시되고 실제 content는 변경되지 않습니다.
@@ -114,36 +145,47 @@ function renderSettings() {
 
     const $target = $('#extensions_settings2').length ? $('#extensions_settings2') : $('#extensions_settings');
     if ($target.length === 0) {
-        console.warn(`[${EXT_NAME}] no extensions_settings target yet`);
+        console.warn(`[${EXT_TAG}] no extensions_settings target yet`);
         return false;
     }
-    if ($target.find('.lbt-settings').length > 0) return true;
+    if ($target.find('.cslt-settings').length > 0) return true;
 
     $target.append(html);
-    console.log(`[${EXT_NAME}] settings UI appended`);
+    console.log(`[${EXT_TAG}] settings UI appended`);
 
-    $('#lbt-profile').on('change', function () {
+    $('#cslt-profile').on('change', function () {
         getSettings().profileId = String($(this).val() || '');
         saveSettingsDebounced();
     });
-    $('#lbt-unit').on('change', function () {
+    $('#cslt-unit').on('change', function () {
         getSettings().translateUnit = String($(this).val() || 'all');
         saveSettingsDebounced();
     });
-    $('#lbt-target').on('input', function () {
+    $('#cslt-target').on('input', function () {
         getSettings().targetLang = String($(this).val() || '한국어');
         saveSettingsDebounced();
     });
-    $('#lbt-maxtokens').on('input', function () {
+    $('#cslt-maxtokens').on('input', function () {
         const v = parseInt($(this).val(), 10);
         if (Number.isFinite(v) && v >= 512) {
             getSettings().maxTokens = v;
             saveSettingsDebounced();
         }
     });
-    $('#lbt-autoadd').on('change', function () {
+    $('#cslt-autoadd').on('change', function () {
         getSettings().autoAddKoreanKeys = $(this).is(':checked');
         saveSettingsDebounced();
+    });
+    $('#cslt-bulk-skip').on('change', function () {
+        getSettings().bulkSkipTranslated = $(this).is(':checked');
+        saveSettingsDebounced();
+    });
+    $('#cslt-bulk-delay').on('input', function () {
+        const v = parseInt($(this).val(), 10);
+        if (Number.isFinite(v) && v >= 0) {
+            getSettings().bulkDelayMs = v;
+            saveSettingsDebounced();
+        }
     });
     return true;
 }
@@ -151,7 +193,7 @@ function renderSettings() {
 function refreshProfileDropdown() {
     const settings = getSettings();
     const profiles = getConnectionProfiles();
-    const $sel = $('#lbt-profile');
+    const $sel = $('#cslt-profile');
     if ($sel.length === 0) return;
     const current = String($sel.val() || settings.profileId || '');
     $sel.empty();
@@ -163,6 +205,7 @@ function refreshProfileDropdown() {
     }
 }
 
+// ---------- Translation core ----------
 function buildPrompt(payload, targetLang) {
     const instr = `You are a translator. Translate the given JSON values into ${targetLang}.
 - Preserve the JSON structure and keys EXACTLY.
@@ -173,37 +216,29 @@ function buildPrompt(payload, targetLang) {
     return `${instr}\n\nINPUT:\n${JSON.stringify(payload, null, 2)}`;
 }
 
-// Try to recover partial data even from truncated JSON
 function recoverPartialJson(text) {
     if (!text) return null;
     let t = String(text).trim();
     t = t.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
 
-    // 1. Try strict parse first
     try { return { data: JSON.parse(t), truncated: false }; } catch {}
 
-    // 2. Find {...} block and try strict
     const braceMatch = t.match(/\{[\s\S]*\}/);
     if (braceMatch) {
         try { return { data: JSON.parse(braceMatch[0]), truncated: false }; } catch {}
     }
 
-    // 3. Recovery mode — partial JSON. Extract what we can.
     const recovered = {};
-
-    // Extract keys array (even if cut off mid-content later)
     const keysMatch = t.match(/"keys"\s*:\s*\[([\s\S]*?)\](?=\s*[,}])/);
     if (keysMatch) {
         try {
             recovered.keys = JSON.parse('[' + keysMatch[1] + ']');
         } catch {
-            // Try to salvage individual strings
             const strs = keysMatch[1].match(/"((?:[^"\\]|\\.)*)"/g);
             if (strs) recovered.keys = strs.map(s => JSON.parse(s));
         }
     }
 
-    // Extract content string (handle truncation)
     const contentStart = t.search(/"content"\s*:\s*"/);
     if (contentStart !== -1) {
         const afterKey = t.indexOf('"', t.indexOf(':', contentStart) + 1) + 1;
@@ -212,14 +247,11 @@ function recoverPartialJson(text) {
             if (t[i] === '\\') { i++; continue; }
             if (t[i] === '"') { endQuote = i; break; }
         }
-        const raw = endQuote === -1
-            ? t.slice(afterKey)            // truncated — take rest
-            : t.slice(afterKey, endQuote); // complete
+        const raw = endQuote === -1 ? t.slice(afterKey) : t.slice(afterKey, endQuote);
         try {
-            // Decode escapes by wrapping in quotes for JSON.parse
             recovered.content = JSON.parse('"' + raw.replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"');
         } catch {
-            recovered.content = raw; // last resort: raw text
+            recovered.content = raw;
         }
     }
 
@@ -246,15 +278,16 @@ async function callProfile(prompt, maxTokens) {
         if (result?.content) return result.content;
         return String(result ?? '');
     } catch (err) {
-        console.error(`[${EXT_NAME}] profile request failed`, err);
-        toastr.error(`번역 요청 실패: ${err?.message ?? err}`, EXT_NAME);
-        return null;
+        console.error(`[${EXT_TAG}] profile request failed`, err);
+        throw err;
     }
 }
 
-async function translateEntry(entryEl) {
+// Translate a single entry. Returns {success, truncated} for bulk reporting.
+async function translateEntry(entryEl, opts = {}) {
     const settings = getSettings();
     const $entry = $(entryEl);
+    const silent = !!opts.silent;
 
     const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
     const $contentInput = $entry.find('textarea[name="content"]').first();
@@ -268,29 +301,37 @@ async function translateEntry(entryEl) {
     else if (settings.translateUnit === 'content') payload = { content };
     else payload = { keys, content };
 
-    const $btn = $entry.find('.lbt-translate-btn');
-    $btn.prop('disabled', true).text('번역 중...');
+    const $btn = $entry.find('.cslt-translate-btn');
+    if (!silent) $btn.addClass('cslt-loading').attr('title', '번역 중...');
 
-    const prompt = buildPrompt(payload, settings.targetLang);
-    const raw = await callProfile(prompt, settings.maxTokens);
-    $btn.prop('disabled', false).text('🌐 번역');
+    let raw;
+    try {
+        raw = await callProfile(buildPrompt(payload, settings.targetLang), settings.maxTokens);
+    } catch (err) {
+        if (!silent) {
+            toastr.error(`번역 요청 실패: ${err?.message ?? err}`, EXT_NAME);
+            $btn.removeClass('cslt-loading').attr('title', '이 항목 번역');
+        }
+        return { success: false, truncated: false };
+    }
 
-    if (!raw) return;
+    if (!silent) $btn.removeClass('cslt-loading').attr('title', '이 항목 번역');
+
+    if (!raw) return { success: false, truncated: false };
 
     const result = recoverPartialJson(raw);
     if (!result) {
-        toastr.error('JSON 파싱 실패. 원본을 패널에 표시합니다.', EXT_NAME);
+        if (!silent) toastr.error('JSON 파싱 실패. 원본을 패널에 표시합니다.', EXT_NAME);
         showResultPanel($entry, { rawText: raw });
-        return;
+        return { success: false, truncated: false };
     }
 
     const { data, truncated } = result;
 
-    if (truncated) {
+    if (truncated && !silent) {
         toastr.warning(
-            `응답이 잘렸습니다. 복구된 부분만 표시합니다. 설정에서 최대 토큰을 늘려보세요. (현재 ${settings.maxTokens})`,
-            EXT_NAME,
-            { timeOut: 7000 }
+            `응답이 잘렸습니다. 복구된 부분만 표시. 토큰을 늘려보세요. (현재 ${settings.maxTokens})`,
+            EXT_NAME, { timeOut: 7000 }
         );
     }
 
@@ -304,31 +345,33 @@ async function translateEntry(entryEl) {
     }
 
     showResultPanel($entry, { ...data, _truncated: truncated });
+    return { success: true, truncated };
 }
 
 function showResultPanel($entry, data) {
-    let $panel = $entry.find('.lbt-result-panel');
+    let $panel = $entry.find('.cslt-result-panel');
     if ($panel.length === 0) {
         $panel = $(`
-            <div class="lbt-result-panel">
-              <div class="lbt-result-header">
-                <b>번역 결과</b>
-                <span class="lbt-result-toggle">접기</span>
+            <div class="cslt-result-panel">
+              <div class="cslt-result-header">
+                <b>🍒 번역 결과</b>
+                <span class="cslt-result-toggle">접기</span>
               </div>
-              <div class="lbt-result-body"></div>
+              <div class="cslt-result-body"></div>
             </div>
         `);
+        // append at end of the entry form (after the drawer content)
         $entry.append($panel);
-        $panel.find('.lbt-result-toggle').on('click', () => {
-            const $b = $panel.find('.lbt-result-body');
+        $panel.find('.cslt-result-toggle').on('click', () => {
+            const $b = $panel.find('.cslt-result-body');
             $b.toggle();
-            $panel.find('.lbt-result-toggle').text($b.is(':visible') ? '접기' : '펼치기');
+            $panel.find('.cslt-result-toggle').text($b.is(':visible') ? '접기' : '펼치기');
         });
     }
-    const $body = $panel.find('.lbt-result-body').empty();
+    const $body = $panel.find('.cslt-result-body').empty();
 
     if (data._truncated) {
-        $('<div class="lbt-warning">⚠️ 응답이 잘려서 일부만 복구됨 (최대 토큰 늘려서 재시도 권장)</div>').appendTo($body);
+        $('<div class="cslt-warning">⚠️ 응답이 잘려서 일부만 복구됨 (최대 토큰 늘려서 재시도 권장)</div>').appendTo($body);
     }
 
     if (data.rawText) {
@@ -336,32 +379,204 @@ function showResultPanel($entry, data) {
         return;
     }
     if (Array.isArray(data.keys)) {
-        $('<div class="lbt-result-section"><b>키워드</b></div>').appendTo($body);
-        $('<div class="lbt-result-keys">').text(data.keys.join(', ')).appendTo($body);
+        $('<div class="cslt-result-section"><b>키워드</b></div>').appendTo($body);
+        $('<div class="cslt-result-keys">').text(data.keys.join(', ')).appendTo($body);
     }
     if (typeof data.content === 'string') {
-        $('<div class="lbt-result-section"><b>본문</b></div>').appendTo($body);
-        $('<div class="lbt-result-content">').text(data.content).appendTo($body);
+        $('<div class="cslt-result-section"><b>본문</b></div>').appendTo($body);
+        $('<div class="cslt-result-content">').text(data.content).appendTo($body);
     }
 }
 
+// ---------- Per-entry button injection ----------
+// Place button next to delete_entry_button to match other header icons
 function injectButton(entryEl) {
     const $entry = $(entryEl);
-    if ($entry.find('.lbt-translate-btn').length > 0) return;
+    if ($entry.find('.cslt-translate-btn').length > 0) return;
 
-    const $btn = $('<div class="menu_button lbt-translate-btn" title="이 항목 번역">🌐 번역</div>');
+    const $btn = $(`<i class="menu_button cslt-translate-btn fa-solid interactable"
+                       title="이 항목 번역 (Cherry&Solti)"
+                       tabindex="0" role="button">🍒</i>`);
     $btn.on('click', (e) => {
         e.stopPropagation();
+        e.preventDefault();
         translateEntry(entryEl);
     });
-    $entry.prepend($btn);
+
+    // Try to insert before move_entry_button (so order: 🍒 ↔ 📋 🗑️)
+    const $moveBtn = $entry.find('.move_entry_button').first();
+    if ($moveBtn.length) {
+        $moveBtn.before($btn);
+    } else {
+        // Fallback: append to header
+        const $header = $entry.find('.inline-drawer-header').first();
+        if ($header.length) $header.append($btn);
+        else $entry.prepend($btn);
+    }
 }
 
+// ---------- Bulk translation ----------
+function getAllEntries() {
+    const popup = document.getElementById('world_popup');
+    if (!popup) return [];
+    return Array.from(popup.querySelectorAll('.world_entry'));
+}
+
+function entryAlreadyTranslated($entry) {
+    return $entry.find('.cslt-result-panel').length > 0;
+}
+
+function buildBulkOverlay() {
+    if ($('#cslt-bulk-overlay').length) return $('#cslt-bulk-overlay');
+    const $overlay = $(`
+        <div id="cslt-bulk-overlay">
+          <div class="cslt-bulk-modal">
+            <div class="cslt-bulk-header">
+              🍒 전체 번역 진행 중
+            </div>
+            <div class="cslt-bulk-progress-wrap">
+              <div class="cslt-bulk-progress-bar"></div>
+            </div>
+            <div class="cslt-bulk-stats">
+              <span class="cslt-bulk-status">준비 중...</span>
+            </div>
+            <div class="cslt-bulk-actions">
+              <button class="menu_button cslt-bulk-pause">일시정지</button>
+              <button class="menu_button cslt-bulk-cancel">취소</button>
+            </div>
+          </div>
+        </div>
+    `);
+    $('body').append($overlay);
+
+    $overlay.find('.cslt-bulk-pause').on('click', () => {
+        bulkState.paused = !bulkState.paused;
+        $overlay.find('.cslt-bulk-pause').text(bulkState.paused ? '재개' : '일시정지');
+    });
+    $overlay.find('.cslt-bulk-cancel').on('click', () => {
+        bulkState.cancelled = true;
+        bulkState.paused = false; // unfreeze loop so it can exit
+    });
+
+    return $overlay;
+}
+
+function updateBulkOverlay() {
+    const $overlay = $('#cslt-bulk-overlay');
+    if (!$overlay.length) return;
+    const pct = bulkState.total ? Math.round((bulkState.done / bulkState.total) * 100) : 0;
+    $overlay.find('.cslt-bulk-progress-bar').css('width', pct + '%');
+    $overlay.find('.cslt-bulk-status').text(
+        `${bulkState.done} / ${bulkState.total} 완료 ` +
+        (bulkState.failed ? `(실패 ${bulkState.failed}) ` : '') +
+        (bulkState.paused ? '⏸ 일시정지됨' : '')
+    );
+}
+
+async function startBulkTranslate() {
+    if (bulkState.running) {
+        toastr.info('이미 진행 중입니다.', EXT_NAME);
+        return;
+    }
+    const settings = getSettings();
+    if (!settings.profileId) {
+        toastr.warning('연결 프로필을 먼저 선택하세요.', EXT_NAME);
+        return;
+    }
+
+    let entries = getAllEntries();
+    if (settings.bulkSkipTranslated) {
+        entries = entries.filter(el => !entryAlreadyTranslated($(el)));
+    }
+
+    if (entries.length === 0) {
+        toastr.info('번역할 항목이 없습니다.', EXT_NAME);
+        return;
+    }
+
+    if (!confirm(`${entries.length}개 항목을 번역합니다.\n호출 간격 ${settings.bulkDelayMs}ms, 예상 소요 약 ${Math.ceil(entries.length * (1.5 + settings.bulkDelayMs / 1000))}초.\n계속하시겠습니까?`)) {
+        return;
+    }
+
+    bulkState = {
+        running: true, paused: false, cancelled: false,
+        total: entries.length, done: 0, failed: 0,
+    };
+
+    const $overlay = buildBulkOverlay();
+    $overlay.show();
+    updateBulkOverlay();
+
+    for (let i = 0; i < entries.length; i++) {
+        // Wait while paused (and bail if cancelled)
+        while (bulkState.paused && !bulkState.cancelled) {
+            await sleep(200);
+        }
+        if (bulkState.cancelled) break;
+
+        const entryEl = entries[i];
+        if (!document.body.contains(entryEl)) {
+            // entry was removed from DOM; skip
+            bulkState.done++;
+            updateBulkOverlay();
+            continue;
+        }
+
+        try {
+            const res = await translateEntry(entryEl, { silent: true });
+            if (!res.success) bulkState.failed++;
+        } catch (err) {
+            console.error(`[${EXT_TAG}] bulk item failed`, err);
+            bulkState.failed++;
+        }
+
+        bulkState.done++;
+        updateBulkOverlay();
+
+        if (i < entries.length - 1 && settings.bulkDelayMs > 0) {
+            await sleep(settings.bulkDelayMs);
+        }
+    }
+
+    const finalMsg = bulkState.cancelled
+        ? `취소됨: ${bulkState.done}/${bulkState.total} 완료, 실패 ${bulkState.failed}`
+        : `완료: ${bulkState.done}/${bulkState.total} (실패 ${bulkState.failed})`;
+    toastr.success(finalMsg, EXT_NAME, { timeOut: 5000 });
+
+    bulkState.running = false;
+    setTimeout(() => $overlay.hide(), 1500);
+}
+
+// ---------- Bulk button injection (top of WI popup) ----------
+function injectBulkButton() {
+    const popup = document.getElementById('world_popup');
+    if (!popup) return;
+    if (popup.querySelector('#cslt-bulk-btn')) return;
+
+    // Find a sensible host. Try common WI toolbar locations, fallback to popup header.
+    const candidates = [
+        '#world_popup_entries_list', // entries container
+        '.world_entry_form_control',
+        '#WIEntryListHeader',
+    ];
+    let host = null;
+    for (const sel of candidates) {
+        const el = popup.querySelector(sel);
+        if (el) { host = el; break; }
+    }
+    // Use a floating button anchored to top-right of #world_popup
+    const $btn = $(`<div id="cslt-bulk-btn" class="menu_button" title="🍒 전체 항목 번역 (Cherry&Solti)">🍒 전체 번역</div>`);
+    $btn.on('click', startBulkTranslate);
+    $(popup).prepend($btn);
+}
+
+// ---------- Observer setup ----------
 const scanAndInjectDebounced = debounce(() => {
     if (!appReady) return;
     const popup = document.getElementById('world_popup');
     if (!popup) return;
     popup.querySelectorAll('.world_entry').forEach(injectButton);
+    injectBulkButton();
 }, 150);
 
 function startScopedObserver() {
@@ -372,7 +587,7 @@ function startScopedObserver() {
     scopedObserver = new MutationObserver(() => scanAndInjectDebounced());
     scopedObserver.observe(popup, { childList: true, subtree: true });
     observerActive = true;
-    console.log(`[${EXT_NAME}] scoped observer attached to #world_popup`);
+    console.log(`[${EXT_TAG}] scoped observer attached`);
     scanAndInjectDebounced();
 }
 
@@ -398,7 +613,7 @@ function watchForWIPopup() {
 function onAppReady() {
     if (appReady) return;
     appReady = true;
-    console.log(`[${EXT_NAME}] APP_READY received`);
+    console.log(`[${EXT_TAG}] APP_READY received`);
 
     if (!renderSettings()) {
         setTimeout(renderSettings, 500);
@@ -412,7 +627,7 @@ function onAppReady() {
 }
 
 jQuery(() => {
-    console.log(`[${EXT_NAME}] jQuery ready, waiting for APP_READY...`);
+    console.log(`[${EXT_TAG}] jQuery ready, waiting for APP_READY...`);
     try {
         if (eventSource && event_types?.APP_READY) {
             eventSource.on(event_types.APP_READY, onAppReady);
@@ -420,7 +635,7 @@ jQuery(() => {
             setTimeout(onAppReady, 2000);
         }
     } catch (e) {
-        console.warn(`[${EXT_NAME}] event hook failed`, e);
+        console.warn(`[${EXT_TAG}] event hook failed`, e);
         setTimeout(onAppReady, 2000);
     }
 });

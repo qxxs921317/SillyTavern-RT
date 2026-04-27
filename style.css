@@ -1,57 +1,94 @@
-.lbt-translate-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
+/* ===== Cherry icon button (per-entry) ===== */
+.cslt-translate-btn {
+    font-style: normal;
+    font-size: 14px;
+    line-height: 1;
     cursor: pointer;
-    margin: 4px;
-    padding: 4px 8px;
-    font-size: 12px;
+    transition: transform 0.15s ease, opacity 0.15s ease;
+    /* match other header icons spacing */
+    padding: 4px 6px;
+}
+.cslt-translate-btn:hover {
+    transform: scale(1.2);
+    filter: drop-shadow(0 0 4px rgba(255, 100, 130, 0.6));
+}
+.cslt-translate-btn.cslt-loading {
+    animation: cslt-spin 0.9s linear infinite;
+    opacity: 0.7;
+}
+@keyframes cslt-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
 }
 
-.lbt-result-panel {
-    margin-top: 8px;
-    padding: 8px;
-    border: 1px solid var(--SmartThemeBorderColor, #555);
+/* ===== Bulk translate button (top of WI popup) ===== */
+#cslt-bulk-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    background: linear-gradient(135deg, rgba(255, 100, 130, 0.15), rgba(255, 180, 100, 0.15));
+    border: 1px solid rgba(255, 130, 150, 0.4);
+}
+#cslt-bulk-btn:hover {
+    background: linear-gradient(135deg, rgba(255, 100, 130, 0.3), rgba(255, 180, 100, 0.3));
+    box-shadow: 0 0 8px rgba(255, 100, 130, 0.4);
+}
+
+/* ===== Result panel (per-entry) ===== */
+.cslt-result-panel {
+    margin: 8px 4px;
+    padding: 10px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 130, 150, 0.3));
+    border-left: 3px solid rgba(255, 100, 130, 0.6);
     border-radius: 6px;
     background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.2));
     font-size: 13px;
 }
 
-.lbt-result-header {
+.cslt-result-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
     margin-bottom: 6px;
 }
 
-.lbt-result-toggle {
+.cslt-result-toggle {
     cursor: pointer;
     opacity: 0.7;
     font-size: 12px;
 }
-.lbt-result-toggle:hover { opacity: 1; }
+.cslt-result-toggle:hover { opacity: 1; }
 
-.lbt-result-section {
-    margin-top: 6px;
+.cslt-result-section {
+    margin-top: 8px;
     opacity: 0.85;
+    font-size: 12px;
 }
 
-.lbt-result-keys {
-    padding: 4px 6px;
+.cslt-result-keys {
+    margin-top: 4px;
+    padding: 6px 8px;
     background: rgba(255,255,255,0.04);
     border-radius: 4px;
     word-break: break-word;
+    font-size: 13px;
 }
 
-.lbt-result-content {
-    padding: 6px;
+.cslt-result-content {
+    margin-top: 4px;
+    padding: 8px;
     background: rgba(255,255,255,0.04);
     border-radius: 4px;
     white-space: pre-wrap;
     line-height: 1.5;
+    font-size: 13px;
 }
 
-.lbt-warning {
+.cslt-warning {
     margin-bottom: 6px;
     padding: 6px 8px;
     background: rgba(255, 180, 80, 0.15);
@@ -60,16 +97,81 @@
     font-size: 12px;
 }
 
-.lbt-result-panel pre {
+.cslt-result-panel pre {
     white-space: pre-wrap;
     word-break: break-word;
     font-size: 12px;
     opacity: 0.85;
 }
 
-.lbt-settings label {
+/* ===== Settings panel ===== */
+.cslt-settings label {
     display: block;
     margin-top: 6px;
     font-weight: 600;
+    font-size: 13px;
+}
+
+/* ===== Bulk overlay modal ===== */
+#cslt-bulk-overlay {
+    display: block;
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 10000;
+    justify-content: center;
+    align-items: center;
+    display: flex;
+}
+
+.cslt-bulk-modal {
+    background: var(--SmartThemeBlurTintColor, #1a1a1a);
+    border: 1px solid rgba(255, 130, 150, 0.5);
+    border-radius: 8px;
+    padding: 20px 24px;
+    min-width: 320px;
+    max-width: 90vw;
+    box-shadow: 0 4px 24px rgba(255, 100, 130, 0.2);
+}
+
+.cslt-bulk-header {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 14px;
+    text-align: center;
+}
+
+.cslt-bulk-progress-wrap {
+    width: 100%;
+    height: 12px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 8px;
+}
+
+.cslt-bulk-progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, rgba(255, 100, 130, 0.8), rgba(255, 180, 100, 0.8));
+    transition: width 0.3s ease;
+}
+
+.cslt-bulk-stats {
+    text-align: center;
+    font-size: 13px;
+    margin-bottom: 14px;
+    opacity: 0.9;
+}
+
+.cslt-bulk-actions {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+}
+
+.cslt-bulk-actions .menu_button {
+    padding: 5px 14px;
     font-size: 13px;
 }
