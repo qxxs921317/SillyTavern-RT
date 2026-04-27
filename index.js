@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types } from '../../../../scr
 
 const EXT_ID = 'lorebook-translator';
 const EXT_NAME = 'Cherry&Solti Lorebook Translator';
-const EXT_TAG = 'CSLT'; // for console logs
+const EXT_TAG = 'CSLT';
 
 console.log(`[${EXT_TAG}] script file loaded`);
 
@@ -15,13 +15,13 @@ const defaultSettings = {
     maxTokens: 8192,
     bulkSkipTranslated: true,
     bulkDelayMs: 500,
+    cache: {}, // { "worldName::uid": { keys: [...], content: "...", truncated: bool, savedAt: ts } }
 };
 
 let appReady = false;
 let observerActive = false;
 let scopedObserver = null;
 
-// Bulk translation state
 let bulkState = {
     running: false,
     paused: false,
@@ -31,14 +31,18 @@ let bulkState = {
     failed: 0,
 };
 
+// ---------- Settings ----------
 function getSettings() {
     if (!extension_settings[EXT_ID]) {
         extension_settings[EXT_ID] = structuredClone(defaultSettings);
     }
     for (const k of Object.keys(defaultSettings)) {
         if (extension_settings[EXT_ID][k] === undefined) {
-            extension_settings[EXT_ID][k] = defaultSettings[k];
+            extension_settings[EXT_ID][k] = structuredClone(defaultSettings[k]);
         }
+    }
+    if (typeof extension_settings[EXT_ID].cache !== 'object' || extension_settings[EXT_ID].cache === null) {
+        extension_settings[EXT_ID].cache = {};
     }
     return extension_settings[EXT_ID];
 }
@@ -75,8 +79,77 @@ function debounce(fn, ms) {
     };
 }
 
-function sleep(ms) {
-    return new Promise(r => setTimeout(r, ms));
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ---------- Cache helpers ----------
+// Identify entry by current world name + UID. Stable across reloads as long as user doesn't rename worlds.
+function getCurrentWorldName() {
+    // Try various places ST stores it
+    const sel = document.querySelector('#world_editor_select');
+    if (sel) {
+        const opt = sel.selectedOptions?.[0];
+        if (opt?.textContent) return opt.textContent.trim();
+    }
+    // Fallback: read from the move_entry_button data attribute (it has data-current-world)
+    const moveBtn = document.querySelector('#world_popup .move_entry_button[data-current-world]');
+    if (moveBtn) return moveBtn.getAttribute('data-current-world') || 'unknown';
+    return 'unknown';
+}
+
+function getEntryUid($entry) {
+    // Try multiple sources
+    const uidAttr = $entry.attr('uid');
+    if (uidAttr) return String(uidAttr);
+    const moveBtn = $entry.find('.move_entry_button[data-uid]').first();
+    if (moveBtn.length) return String(moveBtn.attr('data-uid'));
+    return null;
+}
+
+function makeCacheKey(worldName, uid) {
+    return `${worldName}::${uid}`;
+}
+
+function getCachedTranslation($entry) {
+    const uid = getEntryUid($entry);
+    if (!uid) return null;
+    const key = makeCacheKey(getCurrentWorldName(), uid);
+    return getSettings().cache[key] || null;
+}
+
+function setCachedTranslation($entry, data) {
+    const uid = getEntryUid($entry);
+    if (!uid) return;
+    const key = makeCacheKey(getCurrentWorldName(), uid);
+    getSettings().cache[key] = {
+        keys: Array.isArray(data.keys) ? data.keys : undefined,
+        content: typeof data.content === 'string' ? data.content : undefined,
+        truncated: !!data._truncated,
+        savedAt: Date.now(),
+    };
+    saveSettingsDebounced();
+}
+
+function deleteCachedTranslation($entry) {
+    const uid = getEntryUid($entry);
+    if (!uid) return;
+    const key = makeCacheKey(getCurrentWorldName(), uid);
+    delete getSettings().cache[key];
+    saveSettingsDebounced();
+}
+
+function deleteAllCachedForCurrentWorld() {
+    const settings = getSettings();
+    const world = getCurrentWorldName();
+    const prefix = `${world}::`;
+    let count = 0;
+    for (const k of Object.keys(settings.cache)) {
+        if (k.startsWith(prefix)) {
+            delete settings.cache[k];
+            count++;
+        }
+    }
+    saveSettingsDebounced();
+    return count;
 }
 
 // ---------- Settings UI ----------
@@ -116,7 +189,6 @@ function renderSettings() {
 
           <label for="cslt-maxtokens" style="margin-top:10px;">최대 응답 토큰</label>
           <input id="cslt-maxtokens" type="number" class="text_pole" min="512" max="32768" step="512" value="${settings.maxTokens}">
-          <small style="opacity:.7;">긴 항목은 8192 이상 권장. 응답이 잘리면 더 늘리세요.</small>
 
           <label class="checkbox_label" style="margin-top:10px;">
             <input id="cslt-autoadd" type="checkbox" ${settings.autoAddKoreanKeys ? 'checked' : ''}>
@@ -134,20 +206,17 @@ function renderSettings() {
 
           <label for="cslt-bulk-delay" style="margin-top:6px;">호출 간격 (ms)</label>
           <input id="cslt-bulk-delay" type="number" class="text_pole" min="0" max="10000" step="100" value="${settings.bulkDelayMs}">
-          <small style="opacity:.7;">레이트 리밋 방지용. Flash는 보통 500ms 정도로 충분.</small>
 
           <small style="opacity:.7; display:block; margin-top:8px;">
-            본문 번역은 항목 아래 패널에 표시되고 실제 content는 변경되지 않습니다.
+            번역 결과는 자동 저장되며 새로고침 후에도 유지됩니다.<br>
+            본문 번역은 별도 패널에 표시되고 실제 content/AI 컨텍스트에는 영향 없습니다.
           </small>
         </div>
       </div>
     </div>`;
 
     const $target = $('#extensions_settings2').length ? $('#extensions_settings2') : $('#extensions_settings');
-    if ($target.length === 0) {
-        console.warn(`[${EXT_TAG}] no extensions_settings target yet`);
-        return false;
-    }
+    if ($target.length === 0) return false;
     if ($target.find('.cslt-settings').length > 0) return true;
 
     $target.append(html);
@@ -272,22 +341,48 @@ async function callProfile(prompt, maxTokens) {
         toastr.error('ConnectionManagerRequestService를 찾을 수 없습니다.', EXT_NAME);
         return null;
     }
-    try {
-        const result = await CMRS.sendRequest(settings.profileId, prompt, maxTokens);
-        if (typeof result === 'string') return result;
-        if (result?.content) return result.content;
-        return String(result ?? '');
-    } catch (err) {
-        console.error(`[${EXT_TAG}] profile request failed`, err);
-        throw err;
-    }
+    const result = await CMRS.sendRequest(settings.profileId, prompt, maxTokens);
+    if (typeof result === 'string') return result;
+    if (result?.content) return result.content;
+    return String(result ?? '');
 }
 
-// Translate a single entry. Returns {success, truncated} for bulk reporting.
+// Ensure entry's drawer is open so textareas are rendered, then read values.
+async function ensureEntryExpanded($entry) {
+    const $drawerContent = $entry.find('.inline-drawer-content').first();
+    const $drawerToggle = $entry.find('.inline-drawer-toggle').first();
+    // Check if it's already expanded — content area visible
+    const isOpen = $drawerContent.is(':visible') && $entry.find('textarea[name="content"]').length > 0;
+    if (isOpen) return true;
+
+    if ($drawerToggle.length) {
+        $drawerToggle.trigger('click');
+        // Wait for ST to render textareas
+        for (let i = 0; i < 20; i++) {
+            await sleep(50);
+            if ($entry.find('textarea[name="content"]').length > 0) return true;
+        }
+    }
+    return false;
+}
+
 async function translateEntry(entryEl, opts = {}) {
     const settings = getSettings();
     const $entry = $(entryEl);
     const silent = !!opts.silent;
+
+    const $btn = $entry.find('.cslt-translate-btn');
+    if (!silent) $btn.addClass('cslt-loading').attr('title', '번역 중...');
+
+    // Make sure drawer is expanded so we can read content/keys
+    const expanded = await ensureEntryExpanded($entry);
+    if (!expanded) {
+        if (!silent) {
+            toastr.error('항목을 펼칠 수 없습니다.', EXT_NAME);
+            $btn.removeClass('cslt-loading').attr('title', '이 항목 번역');
+        }
+        return { success: false, truncated: false };
+    }
 
     const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
     const $contentInput = $entry.find('textarea[name="content"]').first();
@@ -301,13 +396,11 @@ async function translateEntry(entryEl, opts = {}) {
     else if (settings.translateUnit === 'content') payload = { content };
     else payload = { keys, content };
 
-    const $btn = $entry.find('.cslt-translate-btn');
-    if (!silent) $btn.addClass('cslt-loading').attr('title', '번역 중...');
-
     let raw;
     try {
         raw = await callProfile(buildPrompt(payload, settings.targetLang), settings.maxTokens);
     } catch (err) {
+        console.error(`[${EXT_TAG}] request failed`, err);
         if (!silent) {
             toastr.error(`번역 요청 실패: ${err?.message ?? err}`, EXT_NAME);
             $btn.removeClass('cslt-loading').attr('title', '이 항목 번역');
@@ -330,7 +423,7 @@ async function translateEntry(entryEl, opts = {}) {
 
     if (truncated && !silent) {
         toastr.warning(
-            `응답이 잘렸습니다. 복구된 부분만 표시. 토큰을 늘려보세요. (현재 ${settings.maxTokens})`,
+            `응답이 잘렸습니다. 토큰을 늘려보세요. (현재 ${settings.maxTokens})`,
             EXT_NAME, { timeOut: 7000 }
         );
     }
@@ -344,7 +437,10 @@ async function translateEntry(entryEl, opts = {}) {
         $keyInput.val(merged.join(', ')).trigger('input');
     }
 
-    showResultPanel($entry, { ...data, _truncated: truncated });
+    const panelData = { ...data, _truncated: truncated };
+    showResultPanel($entry, panelData);
+    setCachedTranslation($entry, panelData);
+
     return { success: true, truncated };
 }
 
@@ -355,23 +451,34 @@ function showResultPanel($entry, data) {
             <div class="cslt-result-panel">
               <div class="cslt-result-header">
                 <b>🍒 번역 결과</b>
-                <span class="cslt-result-toggle">접기</span>
+                <div class="cslt-result-actions">
+                  <span class="cslt-result-toggle" title="접기/펼치기">접기</span>
+                  <span class="cslt-result-delete" title="이 번역 삭제">🗑️</span>
+                </div>
               </div>
               <div class="cslt-result-body"></div>
             </div>
         `);
-        // append at end of the entry form (after the drawer content)
         $entry.append($panel);
+
         $panel.find('.cslt-result-toggle').on('click', () => {
             const $b = $panel.find('.cslt-result-body');
             $b.toggle();
             $panel.find('.cslt-result-toggle').text($b.is(':visible') ? '접기' : '펼치기');
         });
+
+        $panel.find('.cslt-result-delete').on('click', (e) => {
+            e.stopPropagation();
+            if (!confirm('이 항목의 번역 결과를 삭제하시겠습니까?')) return;
+            deleteCachedTranslation($entry);
+            $panel.remove();
+            toastr.success('번역 삭제됨', EXT_NAME, { timeOut: 2000 });
+        });
     }
     const $body = $panel.find('.cslt-result-body').empty();
 
     if (data._truncated) {
-        $('<div class="cslt-warning">⚠️ 응답이 잘려서 일부만 복구됨 (최대 토큰 늘려서 재시도 권장)</div>').appendTo($body);
+        $('<div class="cslt-warning">⚠️ 응답이 잘려서 일부만 복구됨</div>').appendTo($body);
     }
 
     if (data.rawText) {
@@ -388,8 +495,25 @@ function showResultPanel($entry, data) {
     }
 }
 
+// Restore cached translations into the DOM when entries appear
+function restoreCachedTranslations() {
+    const popup = document.getElementById('world_popup');
+    if (!popup) return;
+    popup.querySelectorAll('.world_entry').forEach(entryEl => {
+        const $entry = $(entryEl);
+        if ($entry.find('.cslt-result-panel').length > 0) return; // already rendered
+        const cached = getCachedTranslation($entry);
+        if (cached) {
+            showResultPanel($entry, {
+                keys: cached.keys,
+                content: cached.content,
+                _truncated: cached.truncated,
+            });
+        }
+    });
+}
+
 // ---------- Per-entry button injection ----------
-// Place button next to delete_entry_button to match other header icons
 function injectButton(entryEl) {
     const $entry = $(entryEl);
     if ($entry.find('.cslt-translate-btn').length > 0) return;
@@ -403,12 +527,10 @@ function injectButton(entryEl) {
         translateEntry(entryEl);
     });
 
-    // Try to insert before move_entry_button (so order: 🍒 ↔ 📋 🗑️)
     const $moveBtn = $entry.find('.move_entry_button').first();
     if ($moveBtn.length) {
         $moveBtn.before($btn);
     } else {
-        // Fallback: append to header
         const $header = $entry.find('.inline-drawer-header').first();
         if ($header.length) $header.append($btn);
         else $entry.prepend($btn);
@@ -423,7 +545,9 @@ function getAllEntries() {
 }
 
 function entryAlreadyTranslated($entry) {
-    return $entry.find('.cslt-result-panel').length > 0;
+    if ($entry.find('.cslt-result-panel').length > 0) return true;
+    if (getCachedTranslation($entry)) return true;
+    return false;
 }
 
 function buildBulkOverlay() {
@@ -431,9 +555,7 @@ function buildBulkOverlay() {
     const $overlay = $(`
         <div id="cslt-bulk-overlay">
           <div class="cslt-bulk-modal">
-            <div class="cslt-bulk-header">
-              🍒 전체 번역 진행 중
-            </div>
+            <div class="cslt-bulk-header">🍒 전체 번역 진행 중</div>
             <div class="cslt-bulk-progress-wrap">
               <div class="cslt-bulk-progress-bar"></div>
             </div>
@@ -455,7 +577,7 @@ function buildBulkOverlay() {
     });
     $overlay.find('.cslt-bulk-cancel').on('click', () => {
         bulkState.cancelled = true;
-        bulkState.paused = false; // unfreeze loop so it can exit
+        bulkState.paused = false;
     });
 
     return $overlay;
@@ -494,7 +616,8 @@ async function startBulkTranslate() {
         return;
     }
 
-    if (!confirm(`${entries.length}개 항목을 번역합니다.\n호출 간격 ${settings.bulkDelayMs}ms, 예상 소요 약 ${Math.ceil(entries.length * (1.5 + settings.bulkDelayMs / 1000))}초.\n계속하시겠습니까?`)) {
+    const estSec = Math.ceil(entries.length * (1.5 + settings.bulkDelayMs / 1000));
+    if (!confirm(`${entries.length}개 항목 번역\n예상 소요: 약 ${estSec}초\n계속하시겠습니까?`)) {
         return;
     }
 
@@ -508,7 +631,6 @@ async function startBulkTranslate() {
     updateBulkOverlay();
 
     for (let i = 0; i < entries.length; i++) {
-        // Wait while paused (and bail if cancelled)
         while (bulkState.paused && !bulkState.cancelled) {
             await sleep(200);
         }
@@ -516,7 +638,6 @@ async function startBulkTranslate() {
 
         const entryEl = entries[i];
         if (!document.body.contains(entryEl)) {
-            // entry was removed from DOM; skip
             bulkState.done++;
             updateBulkOverlay();
             continue;
@@ -547,27 +668,37 @@ async function startBulkTranslate() {
     setTimeout(() => $overlay.hide(), 1500);
 }
 
-// ---------- Bulk button injection (top of WI popup) ----------
-function injectBulkButton() {
+async function deleteAllTranslations() {
+    const world = getCurrentWorldName();
+    if (!confirm(`현재 로어북(${world})의 모든 번역 결과를 삭제하시겠습니까?`)) return;
+    const count = deleteAllCachedForCurrentWorld();
+    // Remove from DOM
+    document.querySelectorAll('#world_popup .cslt-result-panel').forEach(el => el.remove());
+    toastr.success(`${count}개 번역 삭제됨`, EXT_NAME, { timeOut: 3000 });
+}
+
+// ---------- Bulk button bar (top of WI popup) ----------
+function injectBulkButtons() {
     const popup = document.getElementById('world_popup');
     if (!popup) return;
-    if (popup.querySelector('#cslt-bulk-btn')) return;
+    if (popup.querySelector('#cslt-bulk-bar')) return;
 
-    // Find a sensible host. Try common WI toolbar locations, fallback to popup header.
-    const candidates = [
-        '#world_popup_entries_list', // entries container
-        '.world_entry_form_control',
-        '#WIEntryListHeader',
-    ];
-    let host = null;
-    for (const sel of candidates) {
-        const el = popup.querySelector(sel);
-        if (el) { host = el; break; }
-    }
-    // Use a floating button anchored to top-right of #world_popup
-    const $btn = $(`<div id="cslt-bulk-btn" class="menu_button" title="🍒 전체 항목 번역 (Cherry&Solti)">🍒 전체 번역</div>`);
-    $btn.on('click', startBulkTranslate);
-    $(popup).prepend($btn);
+    const $bar = $(`
+        <div id="cslt-bulk-bar">
+          <button id="cslt-bulk-translate" class="menu_button" title="현재 로어북의 모든 항목 번역">
+            🍒 전체 번역
+          </button>
+          <button id="cslt-bulk-delete" class="menu_button" title="현재 로어북의 모든 번역 결과 삭제">
+            🗑️ 전체 삭제
+          </button>
+        </div>
+    `);
+
+    $bar.find('#cslt-bulk-translate').on('click', startBulkTranslate);
+    $bar.find('#cslt-bulk-delete').on('click', deleteAllTranslations);
+
+    // Insert at top of popup
+    $(popup).prepend($bar);
 }
 
 // ---------- Observer setup ----------
@@ -576,7 +707,8 @@ const scanAndInjectDebounced = debounce(() => {
     const popup = document.getElementById('world_popup');
     if (!popup) return;
     popup.querySelectorAll('.world_entry').forEach(injectButton);
-    injectBulkButton();
+    injectBulkButtons();
+    restoreCachedTranslations();
 }, 150);
 
 function startScopedObserver() {
