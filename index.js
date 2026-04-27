@@ -16,7 +16,7 @@ const defaultSettings = {
     bulkSkipTranslated: true,
     bulkDelayMs: 500,
     cache: {},
-    pendingKeys: {}, // { "world::uid": [korean keys not yet saved] }
+    pendingKeys: {},
 };
 
 let appReady = false;
@@ -28,7 +28,6 @@ let bulkState = {
     total: 0, done: 0, failed: 0,
 };
 
-// ST internal save function — resolved lazily
 let savedSaveWorldInfo = null;
 
 // ---------- Settings ----------
@@ -70,11 +69,8 @@ async function resolveCMRS() {
     return null;
 }
 
-// Try to find ST's saveWorldInfo function
 async function resolveSaveWorldInfo() {
     if (savedSaveWorldInfo) return savedSaveWorldInfo;
-
-    // Try getContext (most reliable)
     try {
         const ctx = getContext?.();
         if (typeof ctx?.saveWorldInfo === 'function') {
@@ -83,13 +79,7 @@ async function resolveSaveWorldInfo() {
             return savedSaveWorldInfo;
         }
     } catch {}
-
-    // Try direct import from world-info.js
-    const candidates = [
-        '/scripts/world-info.js',
-        '../../../world-info.js',
-        '../../../../scripts/world-info.js',
-    ];
+    const candidates = ['/scripts/world-info.js', '../../../world-info.js', '../../../../scripts/world-info.js'];
     for (const path of candidates) {
         try {
             const mod = await import(path);
@@ -109,7 +99,7 @@ function debounce(fn, ms) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ---------- Identity helpers ----------
+// ---------- Identity ----------
 function getCurrentWorldName() {
     const sel = document.querySelector('#world_editor_select');
     if (sel) {
@@ -131,7 +121,7 @@ function getEntryUid($entry) {
 
 function makeKey(worldName, uid) { return `${worldName}::${uid}`; }
 
-// ---------- Cache (translation results) ----------
+// ---------- Cache ----------
 function getCachedTranslation($entry) {
     const uid = getEntryUid($entry);
     if (!uid) return null;
@@ -171,7 +161,6 @@ function deleteAllCachedForCurrentWorld() {
     return count;
 }
 
-// ---------- Pending keys (Korean keys added but not yet saved to ST) ----------
 function setPendingKeys($entry, koreanKeys) {
     const uid = getEntryUid($entry);
     if (!uid) return;
@@ -192,64 +181,129 @@ function clearPendingKeys($entry) {
     saveSettingsDebounced();
 }
 
-// ---------- Save translated keys permanently ----------
-async function saveEntryKeysPermanently($entry) {
+// Returns true if entry has unsaved Korean keys (translated but not 💾 saved)
+function hasPendingKeys($entry) {
+    return getPendingKeys($entry).length > 0;
+}
+
+// ---------- Save logic ----------
+async function saveEntryKeysPermanently($entry, opts = {}) {
+    const silent = !!opts.silent;
     const expanded = await ensureEntryExpanded($entry);
     if (!expanded) {
-        toastr.error('항목을 펼칠 수 없어 저장 실패', EXT_NAME);
+        if (!silent) toastr.error('항목을 펼칠 수 없어 저장 실패', EXT_NAME);
         return false;
     }
 
     const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
     if (!$keyInput.length) {
-        toastr.error('키워드 입력란을 찾을 수 없습니다', EXT_NAME);
+        if (!silent) toastr.error('키워드 입력란을 찾을 수 없습니다', EXT_NAME);
         return false;
     }
 
-    // Read currently visible value (may include Korean keys we added)
-    const currentValue = String($keyInput.val() ?? '');
+    // Make sure pending Korean keys are in the input (in case they got reset)
+    const pending = getPendingKeys($entry);
+    if (pending.length > 0) {
+        const current = String($keyInput.val() ?? '').split(',').map(s => s.trim()).filter(Boolean);
+        const merged = Array.from(new Set([...current, ...pending]));
+        $keyInput.val(merged.join(', '));
+    }
 
-    // Trigger ST's input handler to update internal data
-    $keyInput.val(currentValue);
+    // Trigger ST input handlers
     $keyInput[0].dispatchEvent(new Event('input', { bubbles: true }));
     $keyInput[0].dispatchEvent(new Event('change', { bubbles: true }));
     $keyInput[0].dispatchEvent(new Event('blur', { bubbles: true }));
 
-    // Wait a tick for ST to process
-    await sleep(100);
+    await sleep(80);
 
-    // Now call ST's saveWorldInfo to persist
     const saveFn = await resolveSaveWorldInfo();
     const worldName = getCurrentWorldName();
 
     if (saveFn) {
         try {
-            // Try common signatures
-            // 1. saveWorldInfo(name) - name only
-            // 2. saveWorldInfo(name, data, immediately)
-            // We'll try with just the name (most common pattern in ST)
             await saveFn(worldName);
             clearPendingKeys($entry);
-            toastr.success('저장 완료 ✓', EXT_NAME, { timeOut: 2000 });
+            if (!silent) toastr.success('저장 완료 ✓', EXT_NAME, { timeOut: 2000 });
             return true;
         } catch (err) {
             console.error(`[${EXT_TAG}] saveWorldInfo error`, err);
-            // Try alternative: trigger ST's save via debounced settings
-            saveSettingsDebounced();
-            toastr.warning('저장 시도됨. 새로고침해서 확인하세요.', EXT_NAME);
+            if (!silent) toastr.error(`저장 실패: ${err?.message ?? err}`, EXT_NAME);
             return false;
         }
     } else {
-        // Fallback: try clicking ST's WI save button if any
-        const $saveBtn = $('.world_buttons_save, #world_save_button, [data-i18n="Save"]').first();
-        if ($saveBtn.length) {
-            $saveBtn.trigger('click');
-            toastr.info('ST 저장 버튼 트리거 (확인용)', EXT_NAME);
-            return true;
-        }
-        toastr.error('저장 함수를 찾을 수 없습니다. 콘솔을 확인하세요.', EXT_NAME);
-        console.error(`[${EXT_TAG}] No saveWorldInfo function found. Try the WI panel's own save button.`);
+        if (!silent) toastr.error('저장 함수를 찾을 수 없습니다', EXT_NAME);
         return false;
+    }
+}
+
+// Bulk save — save all entries with pending keys
+async function bulkSaveAll() {
+    const popup = document.getElementById('world_popup');
+    if (!popup) return;
+
+    // Find entries that have pending keys (translated but not yet saved)
+    const allEntries = Array.from(popup.querySelectorAll('.world_entry'));
+    const entriesToSave = allEntries.filter(el => hasPendingKeys($(el)));
+
+    if (entriesToSave.length === 0) {
+        toastr.info('저장할 항목이 없습니다. (모두 저장되었거나 번역되지 않음)', EXT_NAME);
+        return;
+    }
+
+    if (!confirm(`${entriesToSave.length}개 항목의 한글 키워드를 저장합니다.\n계속하시겠습니까?`)) {
+        return;
+    }
+
+    const saveFn = await resolveSaveWorldInfo();
+    if (!saveFn) {
+        toastr.error('저장 함수를 찾을 수 없습니다', EXT_NAME);
+        return;
+    }
+
+    let saved = 0, failed = 0;
+    const $btn = $('#cslt-bulk-save');
+    const origText = $btn.text();
+    $btn.text(`💾 저장 중... (0/${entriesToSave.length})`).prop('disabled', true);
+
+    try {
+        for (let i = 0; i < entriesToSave.length; i++) {
+            const $entry = $(entriesToSave[i]);
+
+            // Update each entry's input + dispatch events (don't call saveFn yet)
+            const expanded = await ensureEntryExpanded($entry);
+            if (!expanded) { failed++; continue; }
+
+            const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
+            if (!$keyInput.length) { failed++; continue; }
+
+            const pending = getPendingKeys($entry);
+            if (pending.length > 0) {
+                const current = String($keyInput.val() ?? '').split(',').map(s => s.trim()).filter(Boolean);
+                const merged = Array.from(new Set([...current, ...pending]));
+                $keyInput.val(merged.join(', '));
+            }
+            $keyInput[0].dispatchEvent(new Event('input', { bubbles: true }));
+            $keyInput[0].dispatchEvent(new Event('change', { bubbles: true }));
+            $keyInput[0].dispatchEvent(new Event('blur', { bubbles: true }));
+
+            saved++;
+            $btn.text(`💾 저장 중... (${saved}/${entriesToSave.length})`);
+            await sleep(50); // small delay to let ST process each input event
+        }
+
+        // Single saveWorldInfo call at the end (all entry updates batched)
+        await sleep(200);
+        try {
+            await saveFn(getCurrentWorldName());
+            // Clear pending keys for all saved entries
+            for (const el of entriesToSave) clearPendingKeys($(el));
+            toastr.success(`✓ ${saved}개 항목 저장 완료${failed ? ` (실패 ${failed})` : ''}`, EXT_NAME, { timeOut: 4000 });
+        } catch (err) {
+            console.error(`[${EXT_TAG}] bulk save final saveFn error`, err);
+            toastr.error(`최종 저장 실패: ${err?.message ?? err}`, EXT_NAME);
+        }
+    } finally {
+        $btn.text(origText).prop('disabled', false);
     }
 }
 
@@ -351,7 +405,6 @@ function refreshProfileDropdown() {
     }
 }
 
-// ---------- Translation core ----------
 function buildPrompt(payload, targetLang) {
     return `You are a translator. Translate the given JSON values into ${targetLang}.
 - Preserve the JSON structure and keys EXACTLY.
@@ -367,13 +420,11 @@ ${JSON.stringify(payload, null, 2)}`;
 function recoverPartialJson(text) {
     if (!text) return null;
     let t = String(text).trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
-
     try { return { data: JSON.parse(t), truncated: false }; } catch {}
     const braceMatch = t.match(/\{[\s\S]*\}/);
     if (braceMatch) {
         try { return { data: JSON.parse(braceMatch[0]), truncated: false }; } catch {}
     }
-
     const recovered = {};
     const keysMatch = t.match(/"keys"\s*:\s*\[([\s\S]*?)\](?=\s*[,}])/);
     if (keysMatch) {
@@ -475,14 +526,12 @@ async function translateEntry(entryEl, opts = {}) {
     const { data, truncated } = result;
     if (truncated && !silent) toastr.warning(`응답이 잘렸습니다. (현재 ${settings.maxTokens})`, EXT_NAME, { timeOut: 7000 });
 
-    let addedKeys = [];
     if ((settings.translateUnit === 'keys' || settings.translateUnit === 'all')
         && Array.isArray(data.keys) && settings.autoAddKoreanKeys) {
-        addedKeys = data.keys.map(s => String(s).trim()).filter(Boolean);
+        const addedKeys = data.keys.map(s => String(s).trim()).filter(Boolean);
         const merged = Array.from(new Set([...keys, ...addedKeys]));
         $keyInput.val(merged.join(', '));
         $keyInput[0].dispatchEvent(new Event('input', { bubbles: true }));
-        // Track which keys we added so we know what's "pending save"
         setPendingKeys($entry, addedKeys);
     }
 
@@ -500,7 +549,7 @@ function showResultPanel($entry, data) {
               <div class="cslt-result-header">
                 <b>🍒 번역 결과</b>
                 <div class="cslt-result-actions">
-                  <span class="cslt-result-save" title="키워드를 영구 저장 (새로고침 후에도 유지)">💾</span>
+                  <span class="cslt-result-save" title="키워드 영구 저장">💾</span>
                   <span class="cslt-result-toggle" title="접기/펼치기">접기</span>
                   <span class="cslt-result-delete" title="이 번역 삭제">🗑️</span>
                 </div>
@@ -526,20 +575,17 @@ function showResultPanel($entry, data) {
 
         $panel.find('.cslt-result-delete').on('click', async (e) => {
             e.stopPropagation();
-            if (!confirm('이 번역 결과와 추가된 한글 키워드를 모두 삭제하시겠습니까?')) return;
-            // Remove pending Korean keys from the input
+            if (!confirm('이 번역과 추가된 한글 키워드를 모두 삭제하시겠습니까?')) return;
             await removePendingKeysFromInput($entry);
             deleteCachedTranslation($entry);
             clearPendingKeys($entry);
             $panel.remove();
-            toastr.success('번역 및 추가 키워드 삭제됨', EXT_NAME, { timeOut: 2000 });
+            toastr.success('삭제됨', EXT_NAME, { timeOut: 2000 });
         });
     }
     const $body = $panel.find('.cslt-result-body').empty();
 
-    if (data._truncated) {
-        $('<div class="cslt-warning">⚠️ 응답이 잘려서 일부만 복구됨</div>').appendTo($body);
-    }
+    if (data._truncated) $('<div class="cslt-warning">⚠️ 응답이 잘려서 일부만 복구됨</div>').appendTo($body);
     if (data.rawText) { $('<pre>').text(data.rawText).appendTo($body); return; }
     if (Array.isArray(data.keys)) {
         $('<div class="cslt-result-section"><b>키워드</b></div>').appendTo($body);
@@ -551,7 +597,6 @@ function showResultPanel($entry, data) {
     }
 }
 
-// Remove the Korean keys we added (used when deleting translation)
 async function removePendingKeysFromInput($entry) {
     const pending = getPendingKeys($entry);
     if (pending.length === 0) return;
@@ -559,7 +604,6 @@ async function removePendingKeysFromInput($entry) {
     if (!expanded) return;
     const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
     if (!$keyInput.length) return;
-
     const current = String($keyInput.val() ?? '').split(',').map(s => s.trim()).filter(Boolean);
     const pendingSet = new Set(pending);
     const filtered = current.filter(k => !pendingSet.has(k));
@@ -568,7 +612,6 @@ async function removePendingKeysFromInput($entry) {
     $keyInput[0].dispatchEvent(new Event('change', { bubbles: true }));
 }
 
-// Restore translations + re-add pending Korean keys on page load
 function restoreCachedTranslations() {
     const popup = document.getElementById('world_popup');
     if (!popup) return;
@@ -577,21 +620,14 @@ function restoreCachedTranslations() {
         if ($entry.find('.cslt-result-panel').length > 0) return;
         const cached = getCachedTranslation($entry);
         if (cached) {
-            showResultPanel($entry, {
-                keys: cached.keys, content: cached.content, _truncated: cached.truncated,
-            });
-            // Re-add pending Korean keys to input if drawer is open
+            showResultPanel($entry, { keys: cached.keys, content: cached.content, _truncated: cached.truncated });
             const pending = getPendingKeys($entry);
             if (pending.length > 0) {
                 const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
                 if ($keyInput.length) {
                     const current = String($keyInput.val() ?? '').split(',').map(s => s.trim()).filter(Boolean);
                     const merged = Array.from(new Set([...current, ...pending]));
-                    if (merged.length > current.length) {
-                        $keyInput.val(merged.join(', '));
-                        // Note: we DON'T dispatch input event here to avoid triggering ST save
-                        // User must click 💾 to permanently save
-                    }
+                    if (merged.length > current.length) $keyInput.val(merged.join(', '));
                 }
             }
         }
@@ -602,8 +638,7 @@ function injectButton(entryEl) {
     const $entry = $(entryEl);
     if ($entry.find('.cslt-translate-btn').length > 0) return;
     const $btn = $(`<i class="menu_button cslt-translate-btn fa-solid interactable"
-                       title="이 항목 번역 (Cherry&Solti)"
-                       tabindex="0" role="button">🍒</i>`);
+                       title="이 항목 번역 (Cherry&Solti)" tabindex="0" role="button">🍒</i>`);
     $btn.on('click', (e) => {
         e.stopPropagation(); e.preventDefault();
         translateEntry(entryEl);
@@ -681,7 +716,6 @@ async function startBulkTranslate() {
 
     bulkState = { running: true, paused: false, cancelled: false, total: entries.length, done: 0, failed: 0 };
     const $overlay = buildBulkOverlay();
-    $overlay.css('display', '');  // clear inline display
     $overlay[0].style.removeProperty('display');
     updateBulkOverlay();
 
@@ -702,13 +736,11 @@ async function startBulkTranslate() {
             if (i < entries.length - 1 && settings.bulkDelayMs > 0) await sleep(settings.bulkDelayMs);
         }
     } finally {
-        // Always clean up — even if loop crashes
         const finalMsg = bulkState.cancelled
             ? `취소됨: ${bulkState.done}/${bulkState.total} (실패 ${bulkState.failed})`
             : `완료: ${bulkState.done}/${bulkState.total} (실패 ${bulkState.failed})`;
         toastr.success(finalMsg, EXT_NAME, { timeOut: 5000 });
         bulkState.running = false;
-        // Force-remove overlay regardless of CSS !important issues
         setTimeout(() => {
             const el = document.getElementById('cslt-bulk-overlay');
             if (el) el.remove();
@@ -720,15 +752,11 @@ async function deleteAllTranslations() {
     const world = getCurrentWorldName();
     if (!confirm(`현재 로어북(${world})의 모든 번역 결과를 삭제하시겠습니까?\n(추가된 한글 키워드도 함께 제거됩니다)`)) return;
 
-    // Remove pending Korean keys from each entry's input
     const popup = document.getElementById('world_popup');
     if (popup) {
         const entries = popup.querySelectorAll('.world_entry');
-        for (const el of entries) {
-            await removePendingKeysFromInput($(el));
-        }
+        for (const el of entries) await removePendingKeysFromInput($(el));
     }
-
     const count = deleteAllCachedForCurrentWorld();
     document.querySelectorAll('#world_popup .cslt-result-panel').forEach(el => el.remove());
     toastr.success(`${count}개 번역 삭제됨`, EXT_NAME, { timeOut: 3000 });
@@ -742,10 +770,12 @@ function injectBulkButtons() {
     const $bar = $(`
         <div id="cslt-bulk-bar">
           <button id="cslt-bulk-translate" class="menu_button" title="현재 로어북의 모든 항목 번역">🍒 전체 번역</button>
+          <button id="cslt-bulk-save" class="menu_button" title="저장 안 된 모든 한글 키워드 일괄 저장">💾 전체 저장</button>
           <button id="cslt-bulk-delete" class="menu_button" title="현재 로어북의 모든 번역 결과 삭제">🗑️ 전체 삭제</button>
         </div>
     `);
     $bar.find('#cslt-bulk-translate').on('click', startBulkTranslate);
+    $bar.find('#cslt-bulk-save').on('click', bulkSaveAll);
     $bar.find('#cslt-bulk-delete').on('click', deleteAllTranslations);
     $(popup).prepend($bar);
 }
@@ -788,7 +818,6 @@ function onAppReady() {
     if (!renderSettings()) setTimeout(renderSettings, 500);
     $(document).on('click', '#extensionsMenuButton', () => setTimeout(refreshProfileDropdown, 200));
     watchForWIPopup();
-    // Pre-resolve save function so it's ready when user clicks 💾
     resolveSaveWorldInfo().then(fn => {
         if (!fn) console.warn(`[${EXT_TAG}] saveWorldInfo not available — 💾 button may not work`);
     });
