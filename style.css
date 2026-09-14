@@ -287,3 +287,9 @@
     width: auto !important;
     min-width: max-content;
 }
+
+/* 로어북 파일 읽는 동안 */
+#world_popup.cslt-loading .world_entry {
+    opacity: 0.6;
+    transition: opacity 0.15s ease;
+}

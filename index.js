@@ -15,8 +15,10 @@ const defaultSettings = {
     maxTokens: 8192,
     bulkSkipTranslated: true,
     bulkDelayMs: 500,
-    cache: {},
-    addedKeys: {}, // renamed from pendingKeys; persists even after save
+    // v0.8: cache/addedKeys는 settings가 아니라 /user/files 에 로어북별 파일로 저장됨.
+    // 레거시 키(cache, addedKeys)는 기존 유저 데이터라 여기서 재생성하지 않음.
+    fileIndex: {},   // { "로어북이름": { file, updatedAt } }
+    storageMode: 'file',
 };
 
 let appReady = false;
@@ -40,9 +42,6 @@ function getSettings() {
             extension_settings[EXT_ID][k] = structuredClone(defaultSettings[k]);
         }
     }
-    if (typeof extension_settings[EXT_ID].cache !== 'object') extension_settings[EXT_ID].cache = {};
-    if (typeof extension_settings[EXT_ID].addedKeys !== 'object') extension_settings[EXT_ID].addedKeys = {};
-
     // Migration: copy old pendingKeys data into addedKeys (one-time)
     if (extension_settings[EXT_ID].pendingKeys && typeof extension_settings[EXT_ID].pendingKeys === 'object') {
         for (const k of Object.keys(extension_settings[EXT_ID].pendingKeys)) {
@@ -137,40 +136,263 @@ function getEntryUid($entry) {
 
 function makeKey(worldName, uid) { return `${worldName}::${uid}`; }
 
+
+/* ===================================================================
+ * 파일 기반 저장소 (v0.8)
+ *
+ * 번역 캐시 / 추가된 키워드는 settings.json이 아니라
+ * /user/files/cslt_<해시>.json 에 "로어북 1개당 파일 1개"로 저장됨.
+ * settings에는 인덱스만 남음.
+ *
+ * 기존 유저 보호:
+ *  - 읽기는 캐시 → 파일 → 레거시(settings) 순으로 폴백
+ *  - 레거시 데이터는 자동으로 지우지 않음 (이전 버튼으로만)
+ *  - 파일 API가 없거나 실패하면 레거시 모드로 자동 강등
+ * =================================================================== */
+
+const FILE_UPLOAD_URL = '/api/files/upload';
+const FILE_DELETE_URL = '/api/files/delete';
+const FILE_DIR = '/user/files';
+const PERSIST_DELAY = 1200;     // 연속 작업 시 쓰기 병합
+const PERSIST_MAX_WAIT = 15000; // 전체 번역 중에도 최소 이 주기로는 저장
+
+// 런타임 데이터 — extension_settings 바깥. 키 형식은 기존과 동일한 "world::uid"
+const rtData = { cache: {}, addedKeys: {} };
+
+const loadedWorlds = new Set();
+const worldTimers = new Map();   // world -> { timer, since }
+let storageFailed = false;
+let storageWarned = false;
+
+/**
+ * FNV-1a 32bit — crypto.subtle은 LAN(http) 접속에서 못 쓰므로 순수 JS
+ */
+function fnv1a(str, seed) {
+    let h = seed >>> 0;
+    for (let i = 0; i < str.length; i++) {
+        const c = str.charCodeAt(i);
+        h = Math.imul(h ^ (c & 0xff), 0x01000193) >>> 0;
+        h = Math.imul(h ^ ((c >>> 8) & 0xff), 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+}
+
+function keyHash(str) {
+    const a = fnv1a(str, 0x811c9dc5);
+    const b = fnv1a(`${str}\u0001cslt`, 0x9e3779b1);
+    return a.toString(16).padStart(8, '0') + b.toString(16).padStart(8, '0');
+}
+
+// 서버가 한글/공백/슬래시 파일명을 거부하므로 해시 필수
+function worldFileName(world) { return `cslt_${keyHash(world)}.json`; }
+
+function reqHeaders() {
+    try {
+        const ctx = getContext?.();
+        if (typeof ctx?.getRequestHeaders === 'function') return ctx.getRequestHeaders();
+    } catch { /* noop */ }
+    return { 'Content-Type': 'application/json' };
+}
+
+function toBase64(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(bin);
+}
+
+async function readWorldFile(fileName) {
+    const res = await fetch(`${FILE_DIR}/${fileName}`, { headers: reqHeaders(), cache: 'no-store' });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`읽기 실패 (${res.status})`);
+    return await res.json();
+}
+
+async function writeWorldFile(fileName, payload) {
+    const res = await fetch(FILE_UPLOAD_URL, {
+        method: 'POST',
+        headers: reqHeaders(),
+        body: JSON.stringify({ name: fileName, data: toBase64(JSON.stringify(payload)) }),
+    });
+    if (!res.ok) throw new Error(`저장 실패 (${res.status})`);
+    return true;
+}
+
+/**
+ * 이 로어북에 속한 항목만 추려내기
+ */
+function collectWorldData(world) {
+    const prefix = `${world}::`;
+    const cache = {};
+    const addedKeys = {};
+    for (const [k, v] of Object.entries(rtData.cache)) if (k.startsWith(prefix)) cache[k] = v;
+    for (const [k, v] of Object.entries(rtData.addedKeys)) if (k.startsWith(prefix)) addedKeys[k] = v;
+    return { v: 1, world, cache, addedKeys, updatedAt: Date.now() };
+}
+
+function legacyWorldData(world) {
+    const raw = extension_settings[EXT_ID] || {};
+    const prefix = `${world}::`;
+    const cache = {};
+    const addedKeys = {};
+    for (const [k, v] of Object.entries(raw.cache || {})) if (k.startsWith(prefix)) cache[k] = v;
+    for (const [k, v] of Object.entries(raw.addedKeys || {})) if (k.startsWith(prefix)) addedKeys[k] = v;
+    const count = Object.keys(cache).length + Object.keys(addedKeys).length;
+    return count ? { cache, addedKeys, count } : null;
+}
+
+/**
+ * 로어북 데이터 로드 — 캐시 → 파일 → 레거시
+ * 파일 인덱스가 있으면 레거시는 아예 안 봄 (지운 항목이 되살아나지 않도록)
+ */
+async function ensureWorld(world) {
+    if (!world || world === 'unknown' || loadedWorlds.has(world)) return;
+
+    const settings = getSettings();
+    const indexed = settings.fileIndex?.[world];
+
+    if (indexed?.file && !storageFailed) {
+        try {
+            const file = await readWorldFile(indexed.file);
+            if (file && file.world === world) {
+                Object.assign(rtData.cache, file.cache || {});
+                Object.assign(rtData.addedKeys, file.addedKeys || {});
+                loadedWorlds.add(world);
+                return;
+            }
+            if (file) console.warn(`[${EXT_TAG}] 파일 로어북명 불일치:`, file.world, '≠', world);
+        } catch (err) {
+            console.warn(`[${EXT_TAG}] 파일 읽기 실패:`, err);
+        }
+    }
+
+    const legacy = legacyWorldData(world);
+    loadedWorlds.add(world);
+    if (legacy) {
+        Object.assign(rtData.cache, legacy.cache);
+        Object.assign(rtData.addedKeys, legacy.addedKeys);
+        console.log(`[${EXT_TAG}] 레거시에서 ${legacy.count}개 항목 로드 → 파일로 이관`);
+        scheduleWorldPersist(world, 0);   // 레거시 원본은 그대로 둠
+    }
+}
+
+/**
+ * 저장 예약. 전체 번역처럼 연속 호출될 때는 병합하되,
+ * PERSIST_MAX_WAIT 보다 오래 밀리면 강제로 한 번 쓴다 (중간에 죽어도 손실 최소화)
+ */
+function scheduleWorldPersist(world, delay = PERSIST_DELAY) {
+    if (!world || world === 'unknown') return;
+    let st = worldTimers.get(world);
+    if (!st) {
+        st = { timer: null, since: Date.now() };
+        worldTimers.set(world, st);
+    }
+    if (Date.now() - st.since > PERSIST_MAX_WAIT) {
+        flushWorld(world);
+        return;
+    }
+    clearTimeout(st.timer);
+    st.timer = setTimeout(() => flushWorld(world), delay);
+}
+
+function flushWorld(world) {
+    if (!world || world === 'unknown') return;
+    const st = worldTimers.get(world);
+    if (st) {
+        clearTimeout(st.timer);
+        worldTimers.delete(world);
+    }
+    persistWorld(world).catch(err => console.error(`[${EXT_TAG}] 저장 실패:`, err));
+}
+
+function flushAllWorlds() {
+    for (const world of [...worldTimers.keys()]) flushWorld(world);
+}
+
+async function persistWorld(world) {
+    if (!world || world === 'unknown') return;
+    loadedWorlds.add(world);
+
+    if (storageFailed) {
+        persistLegacyWorld(world);
+        return;
+    }
+
+    const settings = getSettings();
+    const payload = collectWorldData(world);
+    const fileName = worldFileName(world);
+
+    try {
+        // 비어 있어도 파일은 남겨둔다 — 인덱스가 사라지면 레거시가 되살아나므로
+        await writeWorldFile(fileName, payload);
+        if (!settings.fileIndex) settings.fileIndex = {};
+        settings.fileIndex[world] = { file: fileName, updatedAt: payload.updatedAt };
+        settings.storageMode = 'file';
+        saveSettingsDebounced();
+    } catch (err) {
+        console.error(`[${EXT_TAG}] 파일 저장 실패 — 레거시 모드로 전환:`, err);
+        storageFailed = true;
+        getSettings().storageMode = 'legacy';
+        if (!storageWarned) {
+            storageWarned = true;
+            toastr.warning('파일 저장에 실패해서 기존 방식(설정 저장)으로 전환했어. 데이터는 안 날아가.', EXT_NAME);
+        }
+        persistLegacyWorld(world);
+    }
+}
+
+/**
+ * 레거시 모드 — 예전처럼 settings에 직접 씀
+ */
+function persistLegacyWorld(world) {
+    const raw = getSettings();
+    if (!raw.cache) raw.cache = {};
+    if (!raw.addedKeys) raw.addedKeys = {};
+    const prefix = `${world}::`;
+    for (const k of Object.keys(raw.cache)) if (k.startsWith(prefix)) delete raw.cache[k];
+    for (const k of Object.keys(raw.addedKeys)) if (k.startsWith(prefix)) delete raw.addedKeys[k];
+    for (const [k, v] of Object.entries(rtData.cache)) if (k.startsWith(prefix)) raw.cache[k] = v;
+    for (const [k, v] of Object.entries(rtData.addedKeys)) if (k.startsWith(prefix)) raw.addedKeys[k] = v;
+    saveSettingsDebounced();
+}
+
 // ---------- Cache (translation results) ----------
 function getCachedTranslation($entry) {
     const uid = getEntryUid($entry);
     if (!uid) return null;
-    return getSettings().cache[makeKey(getCurrentWorldName(), uid)] || null;
+    return rtData.cache[makeKey(getCurrentWorldName(), uid)] || null;
 }
 
 function setCachedTranslation($entry, data) {
     const uid = getEntryUid($entry);
     if (!uid) return;
-    getSettings().cache[makeKey(getCurrentWorldName(), uid)] = {
+    rtData.cache[makeKey(getCurrentWorldName(), uid)] = {
         keys: Array.isArray(data.keys) ? data.keys : undefined,
         content: typeof data.content === 'string' ? data.content : undefined,
         truncated: !!data._truncated,
         savedAt: Date.now(),
     };
-    saveSettingsDebounced();
+    scheduleWorldPersist(getCurrentWorldName());
 }
 
 function deleteCachedTranslation($entry) {
     const uid = getEntryUid($entry);
     if (!uid) return;
-    delete getSettings().cache[makeKey(getCurrentWorldName(), uid)];
-    saveSettingsDebounced();
+    delete rtData.cache[makeKey(getCurrentWorldName(), uid)];
+    scheduleWorldPersist(getCurrentWorldName());
 }
 
 function deleteAllCachedForCurrentWorld() {
-    const settings = getSettings();
-    const prefix = `${getCurrentWorldName()}::`;
+    const world = getCurrentWorldName();
+    const prefix = `${world}::`;
     let count = 0;
-    for (const k of Object.keys(settings.cache)) {
-        if (k.startsWith(prefix)) { delete settings.cache[k]; count++; }
+    for (const k of Object.keys(rtData.cache)) {
+        if (k.startsWith(prefix)) { delete rtData.cache[k]; count++; }
     }
-    saveSettingsDebounced();
+    flushWorld(world);
     return count;
 }
 
@@ -178,30 +400,30 @@ function deleteAllCachedForCurrentWorld() {
 function setAddedKeys($entry, koreanKeys) {
     const uid = getEntryUid($entry);
     if (!uid) return;
-    getSettings().addedKeys[makeKey(getCurrentWorldName(), uid)] = koreanKeys;
-    saveSettingsDebounced();
+    rtData.addedKeys[makeKey(getCurrentWorldName(), uid)] = koreanKeys;
+    scheduleWorldPersist(getCurrentWorldName());
 }
 
 function getAddedKeys($entry) {
     const uid = getEntryUid($entry);
     if (!uid) return [];
-    return getSettings().addedKeys[makeKey(getCurrentWorldName(), uid)] || [];
+    return rtData.addedKeys[makeKey(getCurrentWorldName(), uid)] || [];
 }
 
 function clearAddedKeys($entry) {
     const uid = getEntryUid($entry);
     if (!uid) return;
-    delete getSettings().addedKeys[makeKey(getCurrentWorldName(), uid)];
-    saveSettingsDebounced();
+    delete rtData.addedKeys[makeKey(getCurrentWorldName(), uid)];
+    scheduleWorldPersist(getCurrentWorldName());
 }
 
 function clearAllAddedKeysForCurrentWorld() {
-    const settings = getSettings();
-    const prefix = `${getCurrentWorldName()}::`;
-    for (const k of Object.keys(settings.addedKeys)) {
-        if (k.startsWith(prefix)) delete settings.addedKeys[k];
+    const world = getCurrentWorldName();
+    const prefix = `${world}::`;
+    for (const k of Object.keys(rtData.addedKeys)) {
+        if (k.startsWith(prefix)) delete rtData.addedKeys[k];
     }
-    saveSettingsDebounced();
+    flushWorld(world);
 }
 
 // ---------- Save logic ----------
@@ -350,6 +572,7 @@ async function bulkSaveAll() {
             await sleep(200);
             await saveFn(getCurrentWorldName());
             // Keep addedKeys — don't clear them
+            flushAllWorlds();
             toastr.success(`✓ ${saved}개 항목 저장 완료${failed ? ` (실패 ${failed})` : ''}`, EXT_NAME, { timeOut: 4000 });
         } finally {
             $btn.text(origText).prop('disabled', false);
@@ -398,6 +621,7 @@ async function bulkCleanupKeys() {
                     console.warn(`[${EXT_TAG}] bulk cleanup final save failed`, err);
                 }
             }
+            flushAllWorlds();
             toastr.success(`✓ ${done}개 항목에서 한글 키워드 제거됨${failed ? ` (실패 ${failed})` : ''}`, EXT_NAME, { timeOut: 4000 });
         } finally {
             $btn.text(origText).prop('disabled', false);
@@ -409,6 +633,267 @@ async function bulkCleanupKeys() {
 }
 
 // ---------- UI ----------
+
+/* ===================================================================
+ * 백업 / 복원 / 레거시 이전
+ * =================================================================== */
+
+const BACKUP_FORMAT = 'cslt-backup';
+
+function legacySizeKB() {
+    const raw = extension_settings[EXT_ID] || {};
+    return JSON.stringify({ cache: raw.cache || {}, addedKeys: raw.addedKeys || {} }).length / 1024;
+}
+
+/**
+ * 인덱스 + 레거시에서 알고 있는 모든 로어북 이름
+ */
+function allWorldNames() {
+    const settings = getSettings();
+    const raw = extension_settings[EXT_ID] || {};
+    const names = new Set(Object.keys(settings.fileIndex || {}));
+    for (const section of ['cache', 'addedKeys']) {
+        for (const k of Object.keys(raw[section] || {})) {
+            const i = k.indexOf('::');
+            if (i > 0) names.add(k.slice(0, i));
+        }
+    }
+    for (const section of ['cache', 'addedKeys']) {
+        for (const k of Object.keys(rtData[section])) {
+            const i = k.indexOf('::');
+            if (i > 0) names.add(k.slice(0, i));
+        }
+    }
+    return [...names];
+}
+
+async function loadAllWorlds() {
+    const names = allWorldNames();
+    for (let i = 0; i < names.length; i += 3) {
+        await Promise.all(names.slice(i, i + 3).map(w => ensureWorld(w).catch(() => {})));
+    }
+    return names;
+}
+
+async function buildBackupObject() {
+    flushAllWorlds();
+    await loadAllWorlds();
+    const settings = getSettings();
+    const raw = extension_settings[EXT_ID] || {};
+    const data = { cache: structuredClone(rtData.cache), addedKeys: structuredClone(rtData.addedKeys) };
+
+    // 파일로 안 옮겨진 레거시 잔여분 합치기 (이미 파일이 있는 로어북은 제외 — 지운 항목 부활 방지)
+    const hasFile = new Set(Object.keys(settings.fileIndex || {}));
+    for (const section of ['cache', 'addedKeys']) {
+        for (const [k, v] of Object.entries(raw[section] || {})) {
+            if (data[section][k] !== undefined) continue;
+            const world = k.slice(0, k.indexOf('::'));
+            if (hasFile.has(world)) continue;
+            data[section][k] = structuredClone(v);
+        }
+    }
+    return { format: BACKUP_FORMAT, formatVersion: 1, exportedAt: new Date().toISOString(), data };
+}
+
+function backupTimestamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+function downloadJson(obj, filename) {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function exportData(silent = false, suffix = '') {
+    try {
+        if (!silent) toastr.info('데이터 수집 중...', EXT_NAME);
+        const backup = await buildBackupObject();
+        downloadJson(backup, `cslt-backup-${backupTimestamp()}${suffix}.json`);
+        if (!silent) {
+            const n = Object.keys(backup.data.cache).length;
+            const kb = JSON.stringify(backup).length / 1024;
+            toastr.success(`백업 저장됨 (번역 ${n}개 · ${kb.toFixed(0)}KB)`, EXT_NAME);
+        }
+        return true;
+    } catch (err) {
+        console.error(`[${EXT_TAG}] 내보내기 실패:`, err);
+        toastr.error('내보내기 실패: ' + err.message, EXT_NAME);
+        return false;
+    }
+}
+
+function parseBackup(text) {
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    } catch {
+        throw new Error('JSON 파싱 실패 — 올바른 백업 파일이 아니야');
+    }
+    if (!parsed || typeof parsed !== 'object') throw new Error('내용이 비어있어');
+    if (parsed.format === BACKUP_FORMAT && parsed.data) return parsed.data;
+    if (parsed.cache || parsed.addedKeys) return parsed;   // settings 덤프도 받아줌
+    throw new Error('로어북 번역기 백업 파일이 아닌 것 같아');
+}
+
+async function importData(file, overwrite) {
+    let data;
+    try {
+        data = parseBackup(await file.text());
+    } catch (err) {
+        toastr.error(err.message, EXT_NAME);
+        return;
+    }
+
+    const cacheCount = Object.keys(data.cache || {}).length;
+    const keyCount = Object.keys(data.addedKeys || {}).length;
+    const worlds = new Set();
+    for (const section of ['cache', 'addedKeys']) {
+        for (const k of Object.keys(data[section] || {})) {
+            const i = k.indexOf('::');
+            if (i > 0) worlds.add(k.slice(0, i));
+        }
+    }
+
+    const mode = overwrite ? '덮어쓰기 (같은 항목은 파일 내용으로 교체)' : '병합 (기존 항목 유지, 없는 것만 추가)';
+    if (!confirm(`이 백업을 불러올까?\n\n• 번역 결과: ${cacheCount}개\n• 추가된 키워드: ${keyCount}개\n• 로어북: ${worlds.size}개\n\n모드: ${mode}\n\n진행 전에 현재 상태를 자동 백업할게.`)) return;
+
+    if (!await exportData(true, '-before-import')) {
+        toastr.error('사전 백업 실패 — 가져오기를 중단했어', EXT_NAME);
+        return;
+    }
+
+    // 병합 판단이 정확하려면 대상 로어북을 먼저 메모리에 올려야 함
+    for (const w of worlds) await ensureWorld(w).catch(() => {});
+
+    let added = 0, replaced = 0, skipped = 0;
+    for (const section of ['cache', 'addedKeys']) {
+        for (const [k, v] of Object.entries(data[section] || {})) {
+            if (rtData[section][k] === undefined) { rtData[section][k] = structuredClone(v); added++; }
+            else if (overwrite) { rtData[section][k] = structuredClone(v); replaced++; }
+            else skipped++;
+        }
+    }
+
+    let saved = 0;
+    for (const w of worlds) {
+        try {
+            await persistWorld(w);
+            saved++;
+        } catch (err) {
+            console.error(`[${EXT_TAG}] 가져오기 저장 실패:`, w, err);
+        }
+    }
+
+    updateDataSizeDisplay();
+    restoreCachedTranslations().catch(() => {});
+    toastr.success(`가져오기 완료 (추가 ${added}${replaced ? ` · 교체 ${replaced}` : ''}${skipped ? ` · 유지 ${skipped}` : ''}) · 로어북 ${saved}개 저장됨`, EXT_NAME);
+}
+
+/**
+ * 레거시(settings) → 파일 이전 + 검증 후 정리
+ */
+async function migrateLegacyToFiles() {
+    const settings = getSettings();
+    const raw = extension_settings[EXT_ID] || {};
+
+    const worlds = new Set();
+    for (const section of ['cache', 'addedKeys']) {
+        for (const k of Object.keys(raw[section] || {})) {
+            const i = k.indexOf('::');
+            if (i > 0) worlds.add(k.slice(0, i));
+        }
+    }
+    if (worlds.size === 0) {
+        toastr.info('이전할 레거시 데이터가 없어', EXT_NAME);
+        return;
+    }
+    if (storageFailed) {
+        toastr.error('파일 저장이 동작하지 않는 상태라 이전할 수 없어', EXT_NAME);
+        return;
+    }
+
+    const kb = legacySizeKB();
+    if (!confirm(`settings에 남아있는 로어북 ${worlds.size}개 (${kb.toFixed(0)}KB)를 파일로 옮길까?\n\n① 자동 백업 → ② 파일로 쓰기 → ③ 다시 읽어서 검증 → ④ 전부 통과하면 삭제 여부를 다시 물어봄\n\n검증에 하나라도 실패하면 기존 데이터는 그대로 둘게.`)) return;
+
+    if (!await exportData(true, '-before-migrate')) {
+        toastr.error('사전 백업 실패 — 이전을 중단했어', EXT_NAME);
+        return;
+    }
+
+    const list = [...worlds];
+    const failures = [];
+    let done = 0;
+    const $status = $('#cslt-data-size');
+
+    for (const world of list) {
+        try {
+            await ensureWorld(world);
+            await persistWorld(world);
+
+            const entry = getSettings().fileIndex?.[world];
+            if (!entry?.file) throw new Error('인덱스 없음');
+            const back = await readWorldFile(entry.file);
+            if (!back || back.world !== world) throw new Error('로어북명 불일치');
+
+            const expect = collectWorldData(world);
+            const norm = (o) => JSON.stringify({ c: o.cache || {}, a: o.addedKeys || {} });
+            if (norm(back) !== norm(expect)) throw new Error('내용 불일치');
+        } catch (err) {
+            console.error(`[${EXT_TAG}] 이전 실패:`, world, err);
+            failures.push(`${world} (${err.message})`);
+        }
+        done++;
+        if ($status.length) $status.text(`이전 중... ${done}/${list.length}`);
+    }
+
+    updateDataSizeDisplay();
+
+    if (failures.length) {
+        toastr.error(`${failures.length}개 실패 — 기존 데이터는 그대로 뒀어. 콘솔 확인해줘`, EXT_NAME);
+        console.error(`[${EXT_TAG}] 실패 목록:`, failures);
+        return;
+    }
+
+    if (!confirm(`로어북 ${list.length}개 전부 파일로 옮기고 검증까지 통과했어.\n\n이제 settings에 남은 옛 데이터(${kb.toFixed(0)}KB)를 지울까?\n\n백업 파일은 이미 받아놨고, 지워도 번역은 파일에서 그대로 읽혀.`)) {
+        toastr.info('이전은 끝났어. 정리는 나중에 해도 돼', EXT_NAME);
+        return;
+    }
+
+    delete extension_settings[EXT_ID].cache;
+    delete extension_settings[EXT_ID].addedKeys;
+    saveSettingsDebounced();
+    updateDataSizeDisplay();
+    toastr.success(`정리 완료 — settings에서 ${kb.toFixed(0)}KB 줄었어`, EXT_NAME);
+}
+
+function updateDataSizeDisplay() {
+    const $el = $('#cslt-data-size');
+    if ($el.length === 0) return;
+    const settings = getSettings();
+    const fileCount = Object.keys(settings.fileIndex || {}).length;
+    const legacyKB = legacySizeKB();
+    const settingsKB = JSON.stringify(settings).length / 1024;
+
+    let text = `파일 ${fileCount}개 · settings 사용량 ${settingsKB.toFixed(1)}KB`;
+    if (storageFailed) text += ' · ⚠ 레거시 모드';
+    $el.text(text);
+
+    const $btn = $('#cslt-migrate');
+    if ($btn.length) {
+        if (legacyKB > 1) $btn.show().html(`<i class="fa-solid fa-right-left"></i> 기존 데이터 이전 (${legacyKB.toFixed(0)}KB)`);
+        else $btn.hide();
+    }
+}
+
 function renderSettings() {
     const settings = getSettings();
     const profiles = getConnectionProfiles();
@@ -462,6 +947,30 @@ function renderSettings() {
           <label for="cslt-bulk-delay" style="margin-top:6px;">호출 간격 (ms)</label>
           <input id="cslt-bulk-delay" type="number" class="text_pole" min="0" max="10000" step="100" value="${settings.bulkDelayMs}">
 
+          <hr style="margin: 12px 0; opacity: .3;">
+
+          <b style="display:block; margin-bottom:6px;">데이터 백업</b>
+          <small style="opacity:.75; display:block;">번역 데이터는 <code>/user/files</code>에 로어북별 파일로 저장돼.</small>
+          <div id="cslt-data-size" style="font-size:.85em; opacity:.7; margin:6px 0;"></div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            <div class="menu_button" id="cslt-export" style="flex:1 1 auto; min-width:110px; margin:0;">
+              <i class="fa-solid fa-download"></i> 내보내기
+            </div>
+            <div class="menu_button" id="cslt-import" style="flex:1 1 auto; min-width:110px; margin:0;">
+              <i class="fa-solid fa-upload"></i> 가져오기
+            </div>
+            <input type="file" id="cslt-import-file" accept=".json,application/json" style="display:none;">
+          </div>
+          <div class="menu_button" id="cslt-migrate" style="display:none; margin-top:6px;">
+            <i class="fa-solid fa-right-left"></i> 기존 데이터 이전
+          </div>
+          <label class="checkbox_label" style="margin-top:6px;">
+            <input id="cslt-import-overwrite" type="checkbox">
+            <span>가져올 때 덮어쓰기 <small style="opacity:.6;">(끄면 없는 것만 추가)</small></span>
+          </label>
+
+          <hr style="margin: 12px 0; opacity: .3;">
+
           <small style="opacity:.7; display:block; margin-top:8px;">
             💾 저장: 한글 키워드 영구 저장<br>
             🧹 제거: 한글 키워드만 제거 (영문 유지)<br>
@@ -489,6 +998,18 @@ function renderSettings() {
         const v = parseInt($(this).val(), 10);
         if (Number.isFinite(v) && v >= 0) { getSettings().bulkDelayMs = v; saveSettingsDebounced(); }
     });
+
+    $('#cslt-export').on('click', () => { exportData(); });
+    $('#cslt-import').on('click', () => { $('#cslt-import-file').val('').trigger('click'); });
+    $('#cslt-import-file').on('change', async function () {
+        const file = this.files?.[0];
+        if (!file) return;
+        await importData(file, $('#cslt-import-overwrite').is(':checked'));
+        this.value = '';
+    });
+    $('#cslt-migrate').on('click', () => { migrateLegacyToFiles(); });
+
+    updateDataSizeDisplay();
     return true;
 }
 
@@ -730,9 +1251,26 @@ function showResultPanel($entry, data) {
     }
 }
 
-function restoreCachedTranslations() {
+let lastWorld = null;
+
+async function restoreCachedTranslations() {
     const popup = document.getElementById('world_popup');
     if (!popup) return;
+
+    const world = getCurrentWorldName();
+    if (lastWorld && lastWorld !== world) flushWorld(lastWorld);   // 다른 로어북으로 전환 → 즉시 저장
+    lastWorld = world;
+
+    if (!loadedWorlds.has(world)) {
+        $(popup).addClass('cslt-loading');
+        try {
+            await ensureWorld(world);
+        } finally {
+            $(popup).removeClass('cslt-loading');
+        }
+        if (getCurrentWorldName() !== world) return;   // 그새 로어북이 바뀜
+    }
+
     popup.querySelectorAll('.world_entry').forEach(entryEl => {
         const $entry = $(entryEl);
         if ($entry.find('.cslt-result-panel').length > 0) return;
@@ -859,6 +1397,7 @@ async function startBulkTranslate() {
             if (i < entries.length - 1 && settings.bulkDelayMs > 0) await sleep(settings.bulkDelayMs);
         }
     } finally {
+        flushAllWorlds();   // 미뤄둔 저장 즉시 반영
         const finalMsg = bulkState.cancelled
             ? `취소됨: ${bulkState.done}/${bulkState.total} (실패 ${bulkState.failed})`
             : `완료: ${bulkState.done}/${bulkState.total} (실패 ${bulkState.failed})`;
@@ -939,7 +1478,7 @@ const scanAndInjectDebounced = debounce(() => {
         if (!popup) return;
         popup.querySelectorAll('.world_entry').forEach(injectButton);
         injectBulkButtons();
-        restoreCachedTranslations();
+        restoreCachedTranslations().catch(err => console.error(`[${EXT_TAG}] restore error`, err));
     } catch (err) {
         console.error(`[${EXT_TAG}] scanAndInject error`, err);
     }
@@ -970,6 +1509,8 @@ function watchForWIPopup() {
 function onAppReady() {
     if (appReady) return;
     appReady = true;
+    window.addEventListener('beforeunload', flushAllWorlds);
+    $(document).on('click', '#world_popup_close, #WI-management-close', () => setTimeout(flushAllWorlds, 100));
     console.log(`[${EXT_TAG}] APP_READY received`);
     if (!renderSettings()) setTimeout(renderSettings, 500);
     $(document).on('click', '#extensionsMenuButton', () => setTimeout(refreshProfileDropdown, 200));
