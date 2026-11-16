@@ -136,6 +136,95 @@ function getEntryUid($entry) {
 
 function makeKey(worldName, uid) { return `${worldName}::${uid}`; }
 
+// ---------- Small helpers (v0.9) ----------
+function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function normText(s) { return String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase(); }
+function splitKeys(s) { return String(s ?? '').split(',').map(x => x.trim()).filter(Boolean); }
+function uniq(arr) { return Array.from(new Set(arr)); }
+
+/**
+ * 원문 지문 — 가져오기 매칭 / "원문 바뀜" 감지용
+ * c: 본문, k: 원래 키(우리가 넣은 한글키 제외, 정렬), t: 제목
+ */
+function srcInfo(content, keys, comment) {
+    const c = normText(content);
+    const k = uniq((keys || []).map(normText).filter(Boolean)).sort().join('|');
+    const t = normText(comment);
+    return { c: c ? keyHash(c) : '', k: k ? keyHash(k) : '', t: t ? keyHash(t) : '' };
+}
+
+/* ---------- ST world-info API (loadWorldInfo / saveWorldInfo / reloadEditor) ---------- */
+let wiApi = null;
+async function resolveWI() {
+    if (wiApi) return wiApi;
+    const api = { load: null, save: null, reload: null };
+    try {
+        const ctx = getContext?.();
+        if (typeof ctx?.loadWorldInfo === 'function') api.load = ctx.loadWorldInfo;
+        if (typeof ctx?.saveWorldInfo === 'function') api.save = ctx.saveWorldInfo;
+        if (typeof ctx?.reloadWorldInfoEditor === 'function') api.reload = ctx.reloadWorldInfoEditor;
+    } catch { /* noop */ }
+    if (!api.load || !api.save || !api.reload) {
+        for (const path of ['/scripts/world-info.js', '../../../world-info.js']) {
+            try {
+                const mod = await import(path);
+                api.load ??= typeof mod?.loadWorldInfo === 'function' ? mod.loadWorldInfo : null;
+                api.save ??= typeof mod?.saveWorldInfo === 'function' ? mod.saveWorldInfo : null;
+                api.reload ??= typeof mod?.reloadEditor === 'function' ? mod.reloadEditor : null;
+                if (api.load) break;
+            } catch { /* noop */ }
+        }
+    }
+    wiApi = api;
+    return api;
+}
+
+function worldExists(name) {
+    const opts = document.querySelectorAll('#world_editor_select option, #world_info option');
+    for (const o of opts) if (o.textContent?.trim() === name) return true;
+    return false;
+}
+
+/** 로어북 항목을 데이터에서 직접 읽음 (페이지에 안 보이는 항목까지) */
+async function loadWorldEntries(world) {
+    const wi = await resolveWI();
+    if (!wi.load) return null;
+    try {
+        const data = await wi.load(world);
+        if (!data?.entries) return null;
+        return Object.values(data.entries).map(e => ({
+            uid: String(e.uid),
+            comment: String(e.comment ?? ''),
+            keys: Array.isArray(e.key) ? e.key.map(String) : [],
+            content: String(e.content ?? ''),
+        }));
+    } catch (err) {
+        console.warn(`[${EXT_TAG}] loadWorldEntries failed:`, world, err);
+        return null;
+    }
+}
+
+function setBtnLabel($btn, text) {
+    const $s = $btn.find('span').first();
+    if ($s.length) $s.text(text); else $btn.text(text);
+}
+function getBtnLabel($btn) {
+    const $s = $btn.find('span').first();
+    return $s.length ? $s.text() : $btn.text();
+}
+
+// Pretendard (dynamic subset — 필요한 글자만 받아옴, 오프라인이면 시스템 폰트로 폴백)
+function loadFont() {
+    if (document.getElementById('cslt-font')) return;
+    const l = document.createElement('link');
+    l.id = 'cslt-font';
+    l.rel = 'stylesheet';
+    l.href = 'https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css';
+    document.head.appendChild(l);
+}
+
 
 /* ===================================================================
  * 파일 기반 저장소 (v0.8)
@@ -366,7 +455,7 @@ function getCachedTranslation($entry) {
     return rtData.cache[makeKey(getCurrentWorldName(), uid)] || null;
 }
 
-function setCachedTranslation($entry, data) {
+function setCachedTranslation($entry, data, extra = {}) {
     const uid = getEntryUid($entry);
     if (!uid) return;
     rtData.cache[makeKey(getCurrentWorldName(), uid)] = {
@@ -374,8 +463,17 @@ function setCachedTranslation($entry, data) {
         content: typeof data.content === 'string' ? data.content : undefined,
         truncated: !!data._truncated,
         savedAt: Date.now(),
+        ...extra,
     };
     scheduleWorldPersist(getCurrentWorldName());
+}
+
+/** 캐시 레코드 → 패널 표시용 데이터 */
+function cacheToPanel(c, stale = false) {
+    return {
+        keys: c.keys, content: c.content, _truncated: c.truncated,
+        edited: !!c.edited, importedFrom: c.importedFrom || '', stale,
+    };
 }
 
 function deleteCachedTranslation($entry) {
@@ -400,7 +498,9 @@ function deleteAllCachedForCurrentWorld() {
 function setAddedKeys($entry, koreanKeys) {
     const uid = getEntryUid($entry);
     if (!uid) return;
-    rtData.addedKeys[makeKey(getCurrentWorldName(), uid)] = koreanKeys;
+    const k = makeKey(getCurrentWorldName(), uid);
+    if (Array.isArray(koreanKeys) && koreanKeys.length) rtData.addedKeys[k] = koreanKeys;
+    else delete rtData.addedKeys[k];
     scheduleWorldPersist(getCurrentWorldName());
 }
 
@@ -543,8 +643,9 @@ async function bulkSaveAll() {
         if (!saveFn) { toastr.error('저장 함수를 찾을 수 없습니다', EXT_NAME); return; }
 
         const $btn = $('#cslt-bulk-save');
-        const origText = $btn.text();
-        $btn.text(`💾 저장 중... (0/${entriesToSave.length})`).prop('disabled', true);
+        const origText = getBtnLabel($btn);
+        setBtnLabel($btn, `0/${entriesToSave.length}`);
+        $btn.prop('disabled', true);
 
         let saved = 0, failed = 0;
         try {
@@ -566,7 +667,7 @@ async function bulkSaveAll() {
                 $keyInput[0].dispatchEvent(new Event('change', { bubbles: true }));
                 $keyInput[0].dispatchEvent(new Event('blur', { bubbles: true }));
                 saved++;
-                $btn.text(`💾 저장 중... (${saved}/${entriesToSave.length})`);
+                setBtnLabel($btn, `${saved}/${entriesToSave.length}`);
                 await sleep(50);
             }
             await sleep(200);
@@ -575,7 +676,7 @@ async function bulkSaveAll() {
             flushAllWorlds();
             toastr.success(`✓ ${saved}개 항목 저장 완료${failed ? ` (실패 ${failed})` : ''}`, EXT_NAME, { timeOut: 4000 });
         } finally {
-            $btn.text(origText).prop('disabled', false);
+            setBtnLabel($btn, origText); $btn.prop('disabled', false);
         }
     } catch (err) {
         console.error(`[${EXT_TAG}] bulkSaveAll error`, err);
@@ -598,8 +699,9 @@ async function bulkCleanupKeys() {
         if (!confirm(`${entriesWithAdded.length}개 항목에서 한글 키워드만 제거합니다.\n(번역 결과 패널은 그대로 유지됩니다)\n계속하시겠습니까?`)) return;
 
         const $btn = $('#cslt-bulk-cleanup');
-        const origText = $btn.text();
-        $btn.text(`🧹 제거 중... (0/${entriesWithAdded.length})`).prop('disabled', true);
+        const origText = getBtnLabel($btn);
+        setBtnLabel($btn, `0/${entriesWithAdded.length}`);
+        $btn.prop('disabled', true);
 
         let done = 0, failed = 0;
         try {
@@ -608,7 +710,7 @@ async function bulkCleanupKeys() {
                 // persist=false here — we'll save once at end for efficiency
                 const ok = await cleanupEntryKeys($entry, { silent: true, persist: false });
                 if (ok) done++; else failed++;
-                $btn.text(`🧹 제거 중... (${done}/${entriesWithAdded.length})`);
+                setBtnLabel($btn, `${done}/${entriesWithAdded.length}`);
                 await sleep(40);
             }
             // Single save at the end
@@ -624,7 +726,7 @@ async function bulkCleanupKeys() {
             flushAllWorlds();
             toastr.success(`✓ ${done}개 항목에서 한글 키워드 제거됨${failed ? ` (실패 ${failed})` : ''}`, EXT_NAME, { timeOut: 4000 });
         } finally {
-            $btn.text(origText).prop('disabled', false);
+            setBtnLabel($btn, origText); $btn.prop('disabled', false);
         }
     } catch (err) {
         console.error(`[${EXT_TAG}] bulkCleanupKeys error`, err);
@@ -971,10 +1073,12 @@ function renderSettings() {
 
           <hr style="margin: 12px 0; opacity: .3;">
 
-          <small style="opacity:.7; display:block; margin-top:8px;">
-            💾 저장: 한글 키워드 영구 저장<br>
-            🧹 제거: 한글 키워드만 제거 (영문 유지)<br>
-            🗑️ 삭제: 번역 결과 패널 삭제 (input 그대로)
+          <small class="cslt-help">
+            <i class="fa-solid fa-pen"></i> 수정: 번역 결과 직접 고치기 (저장하면 한글 키워드도 반영)<br>
+            <i class="fa-solid fa-floppy-disk"></i> 저장: 한글 키워드 영구 저장<br>
+            <i class="fa-solid fa-eraser"></i> 키 제거: 한글 키워드만 제거 (영문 유지)<br>
+            <i class="fa-solid fa-trash-can"></i> 번역 삭제: 번역 결과만 삭제 (키워드 그대로)<br>
+            <i class="fa-solid fa-file-import"></i> 가져오기: 다른 로어북의 같은/비슷한 항목 번역을 한 번에 가져오기
           </small>
         </div>
       </div>
@@ -1107,6 +1211,9 @@ async function translateEntry(entryEl, opts = {}) {
     const $entry = $(entryEl);
     const silent = !!opts.silent;
     const $btn = $entry.find('.cslt-translate-btn');
+    if (!silent && getCachedTranslation($entry)?.edited) {
+        if (!confirm('직접 수정한 번역이 있어.\n다시 번역해서 덮어쓸까?')) return { success: false, truncated: false };
+    }
     if (!silent) $btn.addClass('cslt-loading').attr('title', '번역 중...');
 
     try {
@@ -1123,13 +1230,18 @@ async function translateEntry(entryEl, opts = {}) {
         const $contentInput = $entry.find('textarea[name="content"]').first();
         const keysRaw = String($keyInput.val() ?? '');
         const content = String($contentInput.val() ?? '');
-        const originalKeys = keysRaw.split(',').map(s => s.trim()).filter(Boolean);
+        const originalKeys = splitKeys(keysRaw);
         const originalKeysSet = new Set(originalKeys);
+        // 이전에 우리가 넣은 한글 키는 다시 번역 보내지 않음
+        const prevAdded = new Set(getAddedKeys($entry));
+        const sourceKeys = originalKeys.filter(k => !prevAdded.has(k));
+        const comment = String($entry.find('textarea[name="comment"], input[name="comment"]').first().val() ?? '');
+        const src = srcInfo(content, sourceKeys, comment);
 
         let payload;
-        if (settings.translateUnit === 'keys') payload = { keys: originalKeys };
+        if (settings.translateUnit === 'keys') payload = { keys: sourceKeys };
         else if (settings.translateUnit === 'content') payload = { content };
-        else payload = { keys: originalKeys, content };
+        else payload = { keys: sourceKeys, content };
 
         let raw;
         try {
@@ -1174,8 +1286,8 @@ async function translateEntry(entryEl, opts = {}) {
         }
 
         const panelData = { ...data, _truncated: truncated };
+        setCachedTranslation($entry, panelData, { src, edited: false });
         showResultPanel($entry, panelData);
-        setCachedTranslation($entry, panelData);
         return { success: true, truncated };
     } catch (err) {
         console.error(`[${EXT_TAG}] translateEntry error`, err);
@@ -1187,68 +1299,199 @@ async function translateEntry(entryEl, opts = {}) {
     }
 }
 
+/* ===================================================================
+ * 번역 결과 패널 (v0.9) — 보기 / 편집
+ * =================================================================== */
+
+const PANEL_HTML = `
+<div class="cslt-result-panel">
+  <div class="cslt-result-header">
+    <div class="cslt-result-title">
+      <i class="fa-solid fa-language"></i><span>번역</span><span class="cslt-badges"></span>
+    </div>
+    <div class="cslt-result-actions">
+      <button type="button" class="cslt-act" data-act="edit" title="번역 수정"><i class="fa-solid fa-pen"></i></button>
+      <button type="button" class="cslt-act" data-act="save" title="한글 키워드 영구 저장"><i class="fa-solid fa-floppy-disk"></i></button>
+      <button type="button" class="cslt-act" data-act="cleanup" title="한글 키워드만 제거 (번역 결과 유지)"><i class="fa-solid fa-eraser"></i></button>
+      <button type="button" class="cslt-act cslt-act-danger" data-act="delete" title="번역 결과 삭제 (한글 키워드 유지)"><i class="fa-solid fa-trash-can"></i></button>
+      <button type="button" class="cslt-act cslt-act-toggle" data-act="toggle" title="접기/펼치기"><i class="fa-solid fa-chevron-up"></i></button>
+    </div>
+  </div>
+  <div class="cslt-result-body"></div>
+</div>`;
+
 function showResultPanel($entry, data) {
     let $panel = $entry.find('.cslt-result-panel');
     if ($panel.length === 0) {
-        $panel = $(`
-            <div class="cslt-result-panel">
-              <div class="cslt-result-header">
-                <b>🍒 번역 결과</b>
-                <div class="cslt-result-actions">
-                  <span class="cslt-result-save" title="한글 키워드 영구 저장">💾</span>
-                  <span class="cslt-result-cleanup" title="한글 키워드만 제거 (번역 결과 유지)">🧹</span>
-                  <span class="cslt-result-delete" title="번역 결과 삭제 (한글 키워드 유지)">🗑️</span>
-                  <span class="cslt-result-toggle" title="접기/펼치기">접기</span>
-                </div>
-              </div>
-              <div class="cslt-result-body"></div>
-            </div>
-        `);
+        $panel = $(PANEL_HTML);
         $entry.append($panel);
-
-        $panel.find('.cslt-result-toggle').on('click', () => {
-            const $b = $panel.find('.cslt-result-body');
-            $b.toggle();
-            $panel.find('.cslt-result-toggle').text($b.is(':visible') ? '접기' : '펼치기');
+        $panel.on('click', '.cslt-act', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            onPanelAction($entry, $panel, $(e.currentTarget).data('act'));
         });
+        // 편집 영역 클릭이 ST 드로어 토글로 새지 않게
+        $panel.on('click', (e) => e.stopPropagation());
+    }
+    $panel.data('cslt', data);
+    $panel.removeClass('cslt-editing');
+    renderPanelView($entry, $panel);
+}
 
-        $panel.find('.cslt-result-save').on('click', async (e) => {
-            e.stopPropagation();
-            const $btn = $panel.find('.cslt-result-save');
-            $btn.text('⏳').css('opacity', 0.5);
+function renderPanelBadges($panel, data) {
+    const $b = $panel.find('.cslt-badges').empty();
+    if (data.edited) $b.append('<span class="cslt-badge cslt-badge-edited">수정됨</span>');
+    if (data.importedFrom) $b.append($('<span class="cslt-badge cslt-badge-import">가져옴</span>').attr('title', `출처: ${data.importedFrom}`));
+    if (data.stale) $b.append('<span class="cslt-badge cslt-badge-stale" title="번역한 뒤에 원문이 바뀌었어">원문 변경</span>');
+}
+
+function renderPanelView($entry, $panel) {
+    const data = $panel.data('cslt') || {};
+    renderPanelBadges($panel, data);
+    const $body = $panel.find('.cslt-result-body').empty();
+
+    if (data._truncated) $('<div class="cslt-warning"><i class="fa-solid fa-triangle-exclamation"></i> 응답이 잘려서 일부만 복구됨</div>').appendTo($body);
+    if (data.rawText) { $('<pre class="cslt-raw">').text(data.rawText).appendTo($body); return; }
+
+    if (Array.isArray(data.keys) && data.keys.length) {
+        const added = new Set(getAddedKeys($entry));
+        $('<div class="cslt-cap">키워드</div>').appendTo($body);
+        const $chips = $('<div class="cslt-chips">').appendTo($body);
+        for (const k of data.keys) {
+            const t = String(k).trim();
+            if (!t) continue;
+            $('<span class="cslt-chip">').toggleClass('cslt-chip-added', added.has(t))
+                .attr('title', added.has(t) ? '로어북 키에 추가됨' : '')
+                .text(t).appendTo($chips);
+        }
+    }
+    if (typeof data.content === 'string') {
+        $('<div class="cslt-cap">본문</div>').appendTo($body);
+        $('<div class="cslt-result-content">').text(data.content).appendTo($body);
+    }
+}
+
+function renderPanelEdit($entry, $panel) {
+    const data = $panel.data('cslt') || {};
+    $panel.addClass('cslt-editing').removeClass('cslt-collapsed');
+    const $body = $panel.find('.cslt-result-body').empty();
+
+    if (Array.isArray(data.keys)) {
+        $('<div class="cslt-cap">키워드 <small>쉼표로 구분</small></div>').appendTo($body);
+        $('<input type="text" class="text_pole cslt-edit-keys">').val(data.keys.join(', ')).appendTo($body);
+    }
+    if (typeof data.content === 'string') {
+        $('<div class="cslt-cap">본문</div>').appendTo($body);
+        const lines = data.content.split('\n').length + Math.ceil(data.content.length / 60);
+        $('<textarea class="text_pole cslt-edit-content">')
+            .attr('rows', Math.min(16, Math.max(4, lines)))
+            .val(data.content).appendTo($body);
+    }
+    const $foot = $(`
+      <div class="cslt-edit-foot">
+        <button type="button" class="cslt-btn cslt-edit-cancel">취소</button>
+        <button type="button" class="cslt-btn cslt-btn-primary cslt-edit-save"><i class="fa-solid fa-check"></i><span>저장</span></button>
+      </div>`).appendTo($body);
+
+    $foot.find('.cslt-edit-cancel').on('click', (e) => {
+        e.stopPropagation();
+        $panel.removeClass('cslt-editing');
+        renderPanelView($entry, $panel);
+    });
+    $foot.find('.cslt-edit-save').on('click', async (e) => {
+        e.stopPropagation();
+        const $btn = $(e.currentTarget).prop('disabled', true);
+        const $k = $body.find('.cslt-edit-keys');
+        const $c = $body.find('.cslt-edit-content');
+        const newKeys = $k.length ? uniq(splitKeys($k.val())) : undefined;
+        const newContent = $c.length ? String($c.val() ?? '') : undefined;
+        try {
+            await saveEditedTranslation($entry, newKeys, newContent);
+        } finally {
+            $btn.prop('disabled', false);
+        }
+    });
+    $body.find('textarea, input').first().trigger('focus');
+}
+
+async function onPanelAction($entry, $panel, act) {
+    const $btn = $panel.find(`.cslt-act[data-act="${act}"]`);
+    switch (act) {
+        case 'toggle':
+            $panel.toggleClass('cslt-collapsed');
+            break;
+        case 'edit':
+            if ($panel.hasClass('cslt-editing')) { $panel.removeClass('cslt-editing'); renderPanelView($entry, $panel); }
+            else renderPanelEdit($entry, $panel);
+            break;
+        case 'save':
+            $btn.addClass('cslt-busy');
             await saveEntryKeysPermanently($entry);
-            $btn.text('💾').css('opacity', '');
-        });
-
-        $panel.find('.cslt-result-cleanup').on('click', async (e) => {
-            e.stopPropagation();
-            if (!confirm('이 항목에 추가된 한글 키워드만 제거하시겠습니까?\n(번역 결과 패널은 유지되고, 영문 키워드는 안전합니다)')) return;
-            const $btn = $panel.find('.cslt-result-cleanup');
-            $btn.text('⏳').css('opacity', 0.5);
+            $btn.removeClass('cslt-busy');
+            renderPanelView($entry, $panel);
+            break;
+        case 'cleanup':
+            if (!confirm('이 항목에 추가된 한글 키워드만 제거할까?\n(번역 결과는 그대로, 영문 키워드는 안전해)')) return;
+            $btn.addClass('cslt-busy');
             await cleanupEntryKeys($entry);
-            $btn.text('🧹').css('opacity', '');
-        });
-
-        $panel.find('.cslt-result-delete').on('click', (e) => {
-            e.stopPropagation();
-            if (!confirm('번역 결과 패널만 삭제하시겠습니까?\n(input의 한글 키워드는 유지됩니다)')) return;
+            $btn.removeClass('cslt-busy');
+            if (!$panel.hasClass('cslt-editing')) renderPanelView($entry, $panel);
+            break;
+        case 'delete':
+            if (!confirm('번역 결과를 삭제할까?\n(키워드 입력란의 한글 키워드는 그대로야)')) return;
             deleteCachedTranslation($entry);
             $panel.remove();
             toastr.success('번역 결과 삭제됨', EXT_NAME, { timeOut: 2000 });
-        });
+            break;
     }
-    const $body = $panel.find('.cslt-result-body').empty();
+}
 
-    if (data._truncated) $('<div class="cslt-warning">⚠️ 응답이 잘려서 일부만 복구됨</div>').appendTo($body);
-    if (data.rawText) { $('<pre>').text(data.rawText).appendTo($body); return; }
-    if (Array.isArray(data.keys)) {
-        $('<div class="cslt-result-section"><b>키워드</b></div>').appendTo($body);
-        $('<div class="cslt-result-keys">').text(data.keys.join(', ')).appendTo($body);
+/**
+ * 키 입력란의 "우리가 넣은 한글 키"를 새 목록으로 교체
+ * 원래 키(영문 등)는 건드리지 않음
+ */
+async function syncAddedKeys($entry, translatedKeys) {
+    const expanded = await ensureEntryExpanded($entry);
+    if (!expanded) return false;
+    const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
+    if (!$keyInput.length) return false;
+
+    const current = splitKeys($keyInput.val());
+    const oldAdded = new Set(getAddedKeys($entry));
+    const originals = current.filter(k => !oldAdded.has(k));
+    const origSet = new Set(originals);
+    const newAdded = uniq(translatedKeys.map(s => String(s).trim()).filter(k => k && !origSet.has(k)));
+
+    $keyInput.val([...originals, ...newAdded].join(', '));
+    for (const ev of ['input', 'change', 'blur']) $keyInput[0].dispatchEvent(new Event(ev, { bubbles: true }));
+    setAddedKeys($entry, newAdded);
+    await sleep(80);
+
+    const saveFn = await resolveSaveWorldInfo();
+    if (saveFn) { try { await saveFn(getCurrentWorldName()); } catch { /* 입력 이벤트로 이미 저장됨 */ } }
+    return true;
+}
+
+async function saveEditedTranslation($entry, newKeys, newContent) {
+    const uid = getEntryUid($entry);
+    if (!uid) { toastr.error('항목 ID를 못 찾았어', EXT_NAME); return; }
+    const world = getCurrentWorldName();
+    const key = makeKey(world, uid);
+    const prev = rtData.cache[key] || {};
+    const next = { ...prev, savedAt: Date.now(), edited: true };
+    if (newKeys !== undefined) next.keys = newKeys;
+    if (newContent !== undefined) next.content = newContent;
+    next.truncated = false;
+    rtData.cache[key] = next;
+    flushWorld(world);
+
+    let keyNote = '';
+    const settings = getSettings();
+    if (newKeys !== undefined && (settings.autoAddKoreanKeys || getAddedKeys($entry).length > 0)) {
+        const ok = await syncAddedKeys($entry, newKeys);
+        keyNote = ok ? ' · 키워드 반영됨' : ' · 키워드 반영 실패';
     }
-    if (typeof data.content === 'string') {
-        $('<div class="cslt-result-section"><b>본문</b></div>').appendTo($body);
-        $('<div class="cslt-result-content">').text(data.content).appendTo($body);
-    }
+    showResultPanel($entry, cacheToPanel(next));
+    toastr.success(`수정 저장됨${keyNote}`, EXT_NAME, { timeOut: 2500 });
 }
 
 let lastWorld = null;
@@ -1271,28 +1514,46 @@ async function restoreCachedTranslations() {
         if (getCurrentWorldName() !== world) return;   // 그새 로어북이 바뀜
     }
 
+    const pending = [];
     popup.querySelectorAll('.world_entry').forEach(entryEl => {
         const $entry = $(entryEl);
         if ($entry.find('.cslt-result-panel').length > 0) return;
         const cached = getCachedTranslation($entry);
-        if (cached) {
-            showResultPanel($entry, { keys: cached.keys, content: cached.content, _truncated: cached.truncated });
-            // If user hasn't saved yet, re-add Korean keys to input (drawer must be open to see effect)
-            const added = getAddedKeys($entry);
-            if (added.length > 0) {
-                const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
-                if ($keyInput.length) {
-                    const current = String($keyInput.val() ?? '').split(',').map(s => s.trim()).filter(Boolean);
-                    const currentSet = new Set(current);
-                    const missing = added.filter(k => !currentSet.has(k));
-                    if (missing.length > 0) {
-                        const merged = [...current, ...missing];
-                        $keyInput.val(merged.join(', '));
-                    }
-                }
+        if (cached) pending.push({ $entry, cached });
+    });
+    if (!pending.length) return;
+
+    // "원문 변경" 감지 — 원문 지문이 있는 번역만
+    let current = null;
+    if (pending.some(p => p.cached.src?.c)) {
+        const entries = await loadWorldEntries(world);
+        if (getCurrentWorldName() !== world) return;
+        if (entries) current = new Map(entries.map(e => [e.uid, e]));
+    }
+
+    for (const { $entry, cached } of pending) {
+        if ($entry.find('.cslt-result-panel').length > 0) continue;
+        let stale = false;
+        const uid = getEntryUid($entry);
+        const cur = current?.get(String(uid));
+        if (cur && cached.src?.c) {
+            const nowC = normText(cur.content);
+            stale = !!nowC && keyHash(nowC) !== cached.src.c;
+        }
+        showResultPanel($entry, cacheToPanel(cached, stale));
+
+        // If user hasn't saved yet, re-add Korean keys to input (drawer must be open to see effect)
+        const added = getAddedKeys($entry);
+        if (added.length > 0) {
+            const $keyInput = $entry.find('textarea[name="key"], input[name="key"]').first();
+            if ($keyInput.length) {
+                const current = splitKeys($keyInput.val());
+                const currentSet = new Set(current);
+                const missing = added.filter(k => !currentSet.has(k));
+                if (missing.length > 0) $keyInput.val([...current, ...missing].join(', '));
             }
         }
-    });
+    }
 }
 
 function injectButton(entryEl) {
@@ -1325,25 +1586,49 @@ function entryAlreadyTranslated($entry) {
     return false;
 }
 
+/* ===================================================================
+ * 공용 모달
+ * =================================================================== */
+function openModal({ id, title, icon = 'fa-language', wide = false, closable = true }) {
+    $(`#${id}`).remove();
+    const $ov = $(`
+      <div id="${id}" class="cslt-overlay">
+        <div class="cslt-modal${wide ? ' cslt-modal-wide' : ''}" role="dialog" aria-modal="true">
+          <div class="cslt-modal-head">
+            <div class="cslt-modal-title"><i class="fa-solid ${icon}"></i><span></span></div>
+            ${closable ? '<button type="button" class="cslt-act cslt-modal-x" title="닫기"><i class="fa-solid fa-xmark"></i></button>' : ''}
+          </div>
+          <div class="cslt-modal-body"></div>
+        </div>
+      </div>`);
+    $ov.find('.cslt-modal-title span').text(title);
+    if (closable) {
+        $ov.find('.cslt-modal-x').on('click', () => $ov.remove());
+        $ov.on('mousedown', (e) => { if (e.target === $ov[0]) $ov.data('downOnBg', true); });
+        $ov.on('click', (e) => { if (e.target === $ov[0] && $ov.data('downOnBg')) $ov.remove(); $ov.data('downOnBg', false); });
+    }
+    $('body').append($ov);
+    return $ov;
+}
+
+/* ===================================================================
+ * 전체 번역 진행 모달
+ * =================================================================== */
 function buildBulkOverlay() {
     if ($('#cslt-bulk-overlay').length) return $('#cslt-bulk-overlay');
-    const $overlay = $(`
-        <div id="cslt-bulk-overlay">
-          <div class="cslt-bulk-modal">
-            <div class="cslt-bulk-header">🍒 전체 번역 진행 중</div>
-            <div class="cslt-bulk-progress-wrap"><div class="cslt-bulk-progress-bar"></div></div>
-            <div class="cslt-bulk-stats"><span class="cslt-bulk-status">준비 중...</span></div>
-            <div class="cslt-bulk-actions">
-              <button class="menu_button cslt-bulk-pause">일시정지</button>
-              <button class="menu_button cslt-bulk-cancel">취소</button>
-            </div>
-          </div>
-        </div>
-    `);
-    $('body').append($overlay);
-    $overlay.find('.cslt-bulk-pause').on('click', () => {
+    const $overlay = openModal({ id: 'cslt-bulk-overlay', title: '전체 번역 중', closable: false });
+    $overlay.find('.cslt-modal-body').html(`
+        <div class="cslt-bulk-progress-wrap"><div class="cslt-bulk-progress-bar"></div></div>
+        <div class="cslt-bulk-stats"><span class="cslt-bulk-status">준비 중...</span></div>
+        <div class="cslt-modal-foot cslt-center">
+          <button type="button" class="cslt-btn cslt-bulk-pause"><i class="fa-solid fa-pause"></i><span>일시정지</span></button>
+          <button type="button" class="cslt-btn cslt-btn-danger cslt-bulk-cancel"><i class="fa-solid fa-stop"></i><span>취소</span></button>
+        </div>`);
+    $overlay.find('.cslt-bulk-pause').on('click', function () {
         bulkState.paused = !bulkState.paused;
-        $overlay.find('.cslt-bulk-pause').text(bulkState.paused ? '재개' : '일시정지');
+        $(this).find('i').attr('class', bulkState.paused ? 'fa-solid fa-play' : 'fa-solid fa-pause');
+        $(this).find('span').text(bulkState.paused ? '재개' : '일시정지');
+        updateBulkOverlay();
     });
     $overlay.find('.cslt-bulk-cancel').on('click', () => {
         bulkState.cancelled = true; bulkState.paused = false;
@@ -1357,27 +1642,31 @@ function updateBulkOverlay() {
     const pct = bulkState.total ? Math.round((bulkState.done / bulkState.total) * 100) : 0;
     $overlay.find('.cslt-bulk-progress-bar').css('width', pct + '%');
     $overlay.find('.cslt-bulk-status').text(
-        `${bulkState.done} / ${bulkState.total} 완료 ` +
-        (bulkState.failed ? `(실패 ${bulkState.failed}) ` : '') +
-        (bulkState.paused ? '⏸ 일시정지됨' : '')
+        `${bulkState.done} / ${bulkState.total} 완료` +
+        (bulkState.failed ? ` · 실패 ${bulkState.failed}` : '') +
+        (bulkState.paused ? ' · 일시정지됨' : ''),
     );
 }
 
 async function startBulkTranslate() {
-    if (bulkState.running) { toastr.info('이미 진행 중입니다.', EXT_NAME); return; }
+    if (bulkState.running) { toastr.info('이미 진행 중이야', EXT_NAME); return; }
     const settings = getSettings();
-    if (!settings.profileId) { toastr.warning('연결 프로필을 먼저 선택하세요.', EXT_NAME); return; }
+    if (!settings.profileId) { toastr.warning('연결 프로필을 먼저 선택해줘', EXT_NAME); return; }
 
     let entries = getAllEntries();
+    // 직접 수정한 번역은 전체 번역에서 항상 보호
+    const before = entries.length;
+    entries = entries.filter(el => !getCachedTranslation($(el))?.edited);
+    const protectedCount = before - entries.length;
     if (settings.bulkSkipTranslated) entries = entries.filter(el => !entryAlreadyTranslated($(el)));
-    if (entries.length === 0) { toastr.info('번역할 항목이 없습니다.', EXT_NAME); return; }
+    if (entries.length === 0) { toastr.info('번역할 항목이 없어', EXT_NAME); return; }
 
     const estSec = Math.ceil(entries.length * (1.5 + settings.bulkDelayMs / 1000));
-    if (!confirm(`${entries.length}개 항목 번역\n예상 소요: 약 ${estSec}초\n계속하시겠습니까?`)) return;
+    const note = protectedCount ? `\n(직접 수정한 ${protectedCount}개는 건너뜀)` : '';
+    if (!confirm(`${entries.length}개 항목 번역\n예상 소요: 약 ${estSec}초${note}\n계속할까?`)) return;
 
     bulkState = { running: true, paused: false, cancelled: false, total: entries.length, done: 0, failed: 0 };
-    const $overlay = buildBulkOverlay();
-    $overlay[0].style.removeProperty('display');
+    buildBulkOverlay();
     updateBulkOverlay();
 
     try {
@@ -1403,17 +1692,14 @@ async function startBulkTranslate() {
             : `완료: ${bulkState.done}/${bulkState.total} (실패 ${bulkState.failed})`;
         toastr.success(finalMsg, EXT_NAME, { timeOut: 5000 });
         bulkState.running = false;
-        setTimeout(() => {
-            const el = document.getElementById('cslt-bulk-overlay');
-            if (el) el.remove();
-        }, 1500);
+        setTimeout(() => $('#cslt-bulk-overlay').remove(), 1200);
     }
 }
 
 // Bulk delete — only translation panels (not Korean keys)
 async function deleteAllTranslations() {
     const world = getCurrentWorldName();
-    if (!confirm(`현재 로어북(${world})의 모든 번역 결과 패널을 삭제하시겠습니까?\n(추가된 한글 키워드는 유지됩니다 — 같이 지우려면 🧹 키워드 제거를 먼저 사용하세요)`)) return;
+    if (!confirm(`현재 로어북(${world})의 번역 결과를 전부 삭제할까?\n(한글 키워드는 그대로야 — 같이 지우려면 "키 제거"를 먼저 눌러줘)`)) return;
     try {
         const count = deleteAllCachedForCurrentWorld();
         document.querySelectorAll('#world_popup .cslt-result-panel').forEach(el => el.remove());
@@ -1427,24 +1713,14 @@ async function deleteAllTranslations() {
 // Smart collapse-all toggle — if any expanded, collapse all; else expand all
 function toggleAllPanels() {
     const $panels = $('#world_popup .cslt-result-panel');
-    if ($panels.length === 0) {
-        toastr.info('번역 결과가 없습니다', EXT_NAME);
-        return;
-    }
-    // Check if any body is visible
-    let anyOpen = false;
-    $panels.each((_, el) => {
-        const $body = $(el).find('.cslt-result-body');
-        if ($body.is(':visible')) { anyOpen = true; return false; }
-    });
+    if ($panels.length === 0) { toastr.info('번역 결과가 없어', EXT_NAME); return; }
+    const anyOpen = $panels.not('.cslt-collapsed').length > 0;
     const $btn = $('#cslt-bulk-collapse');
     if (anyOpen) {
-        $panels.find('.cslt-result-body').hide();
-        $panels.find('.cslt-result-toggle').text('펼치기');
+        $panels.not('.cslt-editing').addClass('cslt-collapsed');
         $btn.addClass('cslt-collapsed-state').attr('title', '모두 펼치기');
     } else {
-        $panels.find('.cslt-result-body').show();
-        $panels.find('.cslt-result-toggle').text('접기');
+        $panels.removeClass('cslt-collapsed');
         $btn.removeClass('cslt-collapsed-state').attr('title', '모두 접기');
     }
 }
@@ -1456,19 +1732,431 @@ function injectBulkButtons() {
 
     const $bar = $(`
         <div id="cslt-bulk-bar">
-          <button id="cslt-bulk-translate" class="menu_button" title="현재 로어북의 모든 항목 번역">🍒 전체 번역</button>
-          <button id="cslt-bulk-save" class="menu_button" title="저장 안 된 모든 한글 키워드 일괄 저장">💾 전체 저장</button>
-          <button id="cslt-bulk-cleanup" class="menu_button" title="추가된 한글 키워드만 일괄 제거 (영문 키워드 유지)">🧹 키워드 제거</button>
-          <button id="cslt-bulk-delete" class="menu_button" title="번역 결과 패널 일괄 삭제 (한글 키워드 유지)">🗑️ 번역 삭제</button>
-          <button id="cslt-bulk-collapse" class="menu_button" title="모두 접기/펼치기">^</button>
+          <button type="button" id="cslt-bulk-translate" class="cslt-btn cslt-btn-primary" title="현재 로어북의 모든 항목 번역">
+            <i class="fa-solid fa-language"></i><span>전체 번역</span>
+          </button>
+          <div class="cslt-seg">
+            <button type="button" id="cslt-bulk-save" title="한글 키워드 일괄 영구 저장"><i class="fa-solid fa-floppy-disk"></i><span>저장</span></button>
+            <button type="button" id="cslt-bulk-cleanup" title="추가된 한글 키워드만 일괄 제거 (영문 키워드 유지)"><i class="fa-solid fa-eraser"></i><span>키 제거</span></button>
+            <button type="button" id="cslt-bulk-delete" class="cslt-seg-danger" title="번역 결과 일괄 삭제 (한글 키워드 유지)"><i class="fa-solid fa-trash-can"></i><span>번역 삭제</span></button>
+            <button type="button" id="cslt-bulk-import" title="다른 로어북의 번역 가져오기"><i class="fa-solid fa-file-import"></i><span>가져오기</span></button>
+          </div>
+          <button type="button" id="cslt-bulk-collapse" class="cslt-btn cslt-btn-icon" title="모두 접기"><i class="fa-solid fa-angles-up"></i></button>
         </div>
     `);
     $bar.find('#cslt-bulk-translate').on('click', startBulkTranslate);
     $bar.find('#cslt-bulk-save').on('click', bulkSaveAll);
     $bar.find('#cslt-bulk-cleanup').on('click', bulkCleanupKeys);
     $bar.find('#cslt-bulk-delete').on('click', deleteAllTranslations);
+    $bar.find('#cslt-bulk-import').on('click', openImportModal);
     $bar.find('#cslt-bulk-collapse').on('click', toggleAllPanels);
     $(popup).prepend($bar);
+}
+
+/* ===================================================================
+ * 다른 로어북에서 번역 가져오기 (v0.9)
+ *
+ * 매칭 순서:
+ *   1) 본문 일치 (공백·대소문자 무시)           → 확실
+ *   2) 제목 + 원래 키 일치                       → 확실
+ *   3) 제목이나 키가 겹치고 본문 유사도 ≥ 75%   → 확인 필요
+ *
+ * 원본 로어북이 남아 있으면 원문을 직접 읽고,
+ * 지워졌으면 번역 때 저장해둔 원문 지문(src)으로만 매칭함.
+ * =================================================================== */
+
+const SIMILAR_MIN = 0.75;
+
+function bigrams(text) {
+    const t = text.replace(/\s+/g, '');
+    const m = new Map();
+    for (let i = 0; i < t.length - 1; i++) {
+        const b = t.substr(i, 2);
+        m.set(b, (m.get(b) || 0) + 1);
+    }
+    return { m, n: Math.max(0, t.length - 1) };
+}
+
+function dice(a, b) {
+    if (!a.n || !b.n) return 0;
+    const [s, l] = a.m.size < b.m.size ? [a, b] : [b, a];
+    let inter = 0;
+    for (const [k, v] of s.m) {
+        const w = l.m.get(k);
+        if (w) inter += Math.min(v, w);
+    }
+    return (2 * inter) / (a.n + b.n);
+}
+
+function hasTranslation(tr) {
+    return tr && (typeof tr.content === 'string' || (Array.isArray(tr.keys) && tr.keys.length > 0));
+}
+
+function stripAdded(world, uid, keys) {
+    const added = new Set(rtData.addedKeys[makeKey(world, uid)] || []);
+    return keys.filter(k => !added.has(k));
+}
+
+/**
+ * 순수 매칭 로직 — 테스트하기 쉽게 DOM/네트워크와 분리
+ * targets: [{uid, comment, keys, content}]  (한글 추가키 제거된 원래 키)
+ * cands:   [{world, uid, tr, info, text, titleN, keySet}]
+ */
+function matchEntries(targets, cands) {
+    const byContent = new Map();
+    const byTK = new Map();
+    const byKey = new Map();
+    const byTitle = new Map();
+    const push = (map, k, v) => { if (!k) return; if (!map.has(k)) map.set(k, []); map.get(k).push(v); };
+    for (const c of cands) {
+        push(byContent, c.info.c, c);
+        if (c.info.t && c.info.k) push(byTK, `${c.info.t}|${c.info.k}`, c);
+        if (c.text) {
+            for (const k of c.keySet) push(byKey, k, c);
+            push(byTitle, c.titleN, c);
+        }
+    }
+    const newest = (list) => list.reduce((a, b) => ((b.tr.savedAt || 0) > (a.tr.savedAt || 0) ? b : a));
+
+    const rows = [];
+    let unmatched = 0;
+    for (const t of targets) {
+        const ti = srcInfo(t.content, t.keys, t.comment);
+        let row = null;
+        if (ti.c && byContent.has(ti.c)) {
+            row = { type: 'exact', reason: '본문 일치', cand: newest(byContent.get(ti.c)) };
+        } else if (ti.t && ti.k && byTK.has(`${ti.t}|${ti.k}`)) {
+            // 여기까지 왔으면 본문은 다름 → 무조건 확인 필요
+            const cand = newest(byTK.get(`${ti.t}|${ti.k}`));
+            const tText = normText(t.content);
+            let reason = '제목·키 일치 · 본문 다름';
+            let score;
+            if (cand.text && tText) {
+                cand._bg ??= bigrams(cand.text);
+                score = dice(bigrams(tText), cand._bg);
+                reason = `제목·키 일치 · 본문 ${Math.round(score * 100)}%`;
+            }
+            row = { type: 'similar', reason, cand, score };
+        } else {
+            const tText = normText(t.content);
+            if (tText.length >= 10) {
+                const pool = new Set();
+                const titleN = normText(t.comment);
+                if (titleN) for (const c of byTitle.get(titleN) || []) pool.add(c);
+                for (const k of t.keys) for (const c of byKey.get(normText(k)) || []) pool.add(c);
+                let best = null, bestScore = 0;
+                const tb = bigrams(tText);
+                for (const c of pool) {
+                    const ratio = c.text.length / tText.length;
+                    if (ratio < 0.5 || ratio > 2) continue;
+                    c._bg ??= bigrams(c.text);
+                    const sc = dice(tb, c._bg);
+                    if (sc > bestScore) { bestScore = sc; best = c; }
+                }
+                if (best && bestScore >= SIMILAR_MIN) {
+                    row = { type: 'similar', reason: `유사 ${Math.round(bestScore * 100)}%`, cand: best, score: bestScore };
+                }
+            }
+        }
+        if (row) { row.target = t; row.targetInfo = ti; rows.push(row); } else unmatched++;
+    }
+    return { rows, unmatched };
+}
+
+async function collectCandidates(sourceWorlds) {
+    const cands = [];
+    let noInfo = 0;
+    for (const src of sourceWorlds) {
+        await ensureWorld(src).catch(() => {});
+        const entries = worldExists(src) ? await loadWorldEntries(src) : null;
+        const byUid = new Map((entries || []).map(e => [e.uid, e]));
+        const prefix = `${src}::`;
+        for (const [k, tr] of Object.entries(rtData.cache)) {
+            if (!k.startsWith(prefix) || !hasTranslation(tr)) continue;
+            const uid = k.slice(prefix.length);
+            const orig = byUid.get(uid);
+            let info = tr.src || null;
+            let text = '', titleN = '', keySet = new Set();
+            if (orig) {
+                const keys = stripAdded(src, uid, orig.keys);
+                info ??= srcInfo(orig.content, keys, orig.comment);
+                text = normText(orig.content);
+                titleN = normText(orig.comment);
+                keySet = new Set(keys.map(normText).filter(Boolean));
+            }
+            if (!info) { noInfo++; continue; }
+            cands.push({ world: src, uid, tr, info, text, titleN, keySet, origText: orig?.content || '' });
+        }
+    }
+    return { cands, noInfo };
+}
+
+async function openImportModal() {
+    const target = getCurrentWorldName();
+    if (!target || target === 'unknown') { toastr.warning('로어북을 먼저 열어줘', EXT_NAME); return; }
+
+    const $ov = openModal({ id: 'cslt-import-overlay', title: '번역 가져오기', icon: 'fa-file-import', wide: true });
+    const $body = $ov.find('.cslt-modal-body').html('<div class="cslt-muted cslt-pad">번역 데이터 불러오는 중...</div>');
+
+    flushAllWorlds();
+    await loadAllWorlds();
+
+    const sources = allWorldNames().filter(w => w !== target).map(w => {
+        const prefix = `${w}::`;
+        let n = 0;
+        for (const [k, v] of Object.entries(rtData.cache)) if (k.startsWith(prefix) && hasTranslation(v)) n++;
+        return { name: w, count: n, exists: worldExists(w) };
+    }).filter(s => s.count > 0).sort((a, b) => a.name.localeCompare(b.name));
+
+    if (!sources.length) {
+        $body.html('<div class="cslt-empty"><i class="fa-solid fa-box-open"></i><div>가져올 번역이 있는 다른 로어북이 없어</div></div>');
+        return;
+    }
+    renderImportStep1($ov, target, sources);
+}
+
+function renderImportStep1($ov, target, sources) {
+    const picked = new Set();
+    const $body = $ov.find('.cslt-modal-body').empty();
+    $body.append($('<div class="cslt-modal-sub">').html(`어느 로어북에서 가져올까? → <b>${esc(target)}</b>`));
+    const $search = $('<input type="search" class="text_pole cslt-search" placeholder="로어북 이름 검색">').appendTo($body);
+    const $list = $('<div class="cslt-list">').appendTo($body);
+    const $foot = $(`
+      <div class="cslt-modal-foot">
+        <span class="cslt-muted cslt-pick-count">0개 선택</span>
+        <button type="button" class="cslt-btn cslt-btn-primary cslt-go" disabled><i class="fa-solid fa-magnifying-glass"></i><span>매칭 찾기</span></button>
+      </div>`).appendTo($body);
+
+    const draw = () => {
+        const q = normText($search.val());
+        const html = sources.filter(s => !q || normText(s.name).includes(q)).map(s => `
+          <label class="cslt-row cslt-row-src">
+            <input type="checkbox" data-name="${esc(s.name)}" ${picked.has(s.name) ? 'checked' : ''}>
+            <div class="cslt-row-main">
+              <div class="cslt-row-top"><span class="cslt-row-title">${esc(s.name)}</span>
+                ${s.exists ? '' : '<span class="cslt-tag cslt-tag-warn" title="원본 로어북이 없어서 원문 지문이 있는 번역만 매칭돼">원본 없음</span>'}
+              </div>
+              <div class="cslt-row-sub">번역 ${s.count}개</div>
+            </div>
+          </label>`).join('');
+        $list.html(html || '<div class="cslt-muted cslt-pad">검색 결과 없음</div>');
+    };
+    const sync = () => {
+        $foot.find('.cslt-pick-count').text(`${picked.size}개 선택`);
+        $foot.find('.cslt-go').prop('disabled', picked.size === 0);
+    };
+    $list.on('change', 'input[type=checkbox]', function () {
+        const n = String($(this).data('name'));
+        if (this.checked) picked.add(n); else picked.delete(n);
+        sync();
+    });
+    $search.on('input', debounce(draw, 120));
+    $foot.find('.cslt-go').on('click', async () => {
+        const $go = $foot.find('.cslt-go').prop('disabled', true);
+        setBtnLabel($go, '찾는 중...');
+        try {
+            await runImportMatch($ov, target, [...picked], () => renderImportStep1($ov, target, sources));
+        } catch (err) {
+            console.error(`[${EXT_TAG}] import match failed`, err);
+            toastr.error(`매칭 실패: ${err?.message ?? err}`, EXT_NAME);
+            setBtnLabel($go, '매칭 찾기');
+            $go.prop('disabled', false);
+        }
+    });
+    draw();
+    sync();
+}
+
+async function runImportMatch($ov, target, sourceWorlds, onBack) {
+    const tEntries = await loadWorldEntries(target);
+    if (!tEntries) throw new Error('현재 로어북 항목을 못 읽었어');
+    const targets = tEntries.map(e => ({ ...e, keys: stripAdded(target, e.uid, e.keys) }));
+    const { cands, noInfo } = await collectCandidates(sourceWorlds);
+    const { rows, unmatched } = matchEntries(targets, cands);
+
+    for (const r of rows) {
+        const existing = rtData.cache[makeKey(target, r.target.uid)];
+        r.existing = hasTranslation(existing) ? existing : null;
+        r.checked = r.type === 'exact' && !r.existing;
+        const tr = r.cand.tr;
+        r.title = r.target.comment || r.target.content.slice(0, 40) || `#${r.target.uid}`;
+        r.snippet = (typeof tr.content === 'string' ? tr.content : (tr.keys || []).join(', ')).replace(/\s+/g, ' ').slice(0, 120);
+        r.hay = normText([r.title, r.target.content, tr.content, (tr.keys || []).join(' '), r.target.keys.join(' '), r.cand.world].join(' '));
+    }
+    renderImportStep2($ov, target, rows, { unmatched, noInfo, total: targets.length }, onBack);
+}
+
+function renderImportStep2($ov, target, rows, stats, onBack) {
+    const $body = $ov.find('.cslt-modal-body').empty();
+    const nExact = rows.filter(r => r.type === 'exact').length;
+    const nSimilar = rows.length - nExact;
+    const nExisting = rows.filter(r => r.existing).length;
+
+    $body.append(`
+      <div class="cslt-stats">
+        <span class="cslt-stat cslt-stat-exact"><b>${nExact}</b> 확실</span>
+        <span class="cslt-stat cslt-stat-similar"><b>${nSimilar}</b> 확인 필요</span>
+        <span class="cslt-stat"><b>${stats.unmatched}</b> 못 찾음</span>
+        ${stats.noInfo ? `<span class="cslt-stat" title="원본 로어북이 없고 예전 버전에서 번역해서 원문 지문이 없는 번역"><b>${stats.noInfo}</b> 원문 정보 없음</span>` : ''}
+      </div>`);
+
+    if (!rows.length) {
+        $body.append('<div class="cslt-empty"><i class="fa-solid fa-face-meh"></i><div>매칭되는 항목이 없어</div></div>');
+        $('<div class="cslt-modal-foot"><button type="button" class="cslt-btn cslt-back"><i class="fa-solid fa-arrow-left"></i><span>뒤로</span></button></div>')
+            .appendTo($body).find('.cslt-back').on('click', onBack);
+        return;
+    }
+
+    const $search = $('<input type="search" class="text_pole cslt-search" placeholder="제목·원문·번역문 검색">').appendTo($body);
+    const $tools = $(`
+      <div class="cslt-tools">
+        <div class="cslt-seg cslt-seg-sm cslt-filter">
+          <button type="button" data-f="all" class="active">전체 ${rows.length}</button>
+          <button type="button" data-f="exact">확실 ${nExact}</button>
+          <button type="button" data-f="similar">확인 필요 ${nSimilar}</button>
+          ${nExisting ? `<button type="button" data-f="existing">덮어씀 ${nExisting}</button>` : ''}
+        </div>
+        <div class="cslt-tools-right">
+          <button type="button" class="cslt-link" data-sel="1">보이는 것 선택</button>
+          <button type="button" class="cslt-link" data-sel="0">해제</button>
+        </div>
+      </div>`).appendTo($body);
+    const $list = $('<div class="cslt-list cslt-list-tall">').appendTo($body);
+    const $foot = $(`
+      <div class="cslt-modal-foot">
+        <label class="checkbox_label cslt-opt"><input type="checkbox" class="cslt-with-keys" ${getSettings().autoAddKoreanKeys ? 'checked' : ''}><span>한글 키워드도 넣기</span></label>
+        <div class="cslt-foot-right">
+          <button type="button" class="cslt-btn cslt-back"><i class="fa-solid fa-arrow-left"></i><span>뒤로</span></button>
+          <button type="button" class="cslt-btn cslt-btn-primary cslt-apply"><i class="fa-solid fa-check"></i><span>적용</span></button>
+        </div>
+      </div>`).appendTo($body);
+
+    let filter = 'all';
+    let visible = [];
+    const passes = (r) => filter === 'all' || (filter === 'existing' ? !!r.existing : r.type === filter);
+
+    const draw = () => {
+        const q = normText($search.val());
+        visible = rows.map((r, i) => i).filter(i => passes(rows[i]) && (!q || rows[i].hay.includes(q)));
+        const html = visible.map(i => {
+            const r = rows[i];
+            const compare = r.type === 'similar' ? `
+              <details class="cslt-compare"><summary>원문 비교</summary>
+                <div class="cslt-compare-grid">
+                  <div><div class="cslt-cap">지금 로어북</div><div class="cslt-compare-text">${esc(r.target.content.slice(0, 600))}</div></div>
+                  <div><div class="cslt-cap">${esc(r.cand.world)}</div><div class="cslt-compare-text">${esc(r.cand.origText.slice(0, 600))}</div></div>
+                </div>
+              </details>` : '';
+            return `
+              <div class="cslt-row${r.checked ? ' is-checked' : ''}" data-i="${i}">
+                <input type="checkbox" ${r.checked ? 'checked' : ''}>
+                <div class="cslt-row-main">
+                  <div class="cslt-row-top">
+                    <span class="cslt-row-title">${esc(r.title)}</span>
+                    <span class="cslt-tag ${r.type === 'exact' ? 'cslt-tag-ok' : 'cslt-tag-warn'}">${esc(r.reason)}</span>
+                    ${r.existing ? `<span class="cslt-tag cslt-tag-danger" title="이미 번역이 있어서 덮어써짐">${r.existing.edited ? '수정본 덮어씀' : '덮어씀'}</span>` : ''}
+                  </div>
+                  <div class="cslt-row-sub">${esc(r.snippet)}</div>
+                  <div class="cslt-row-src-name"><i class="fa-solid fa-arrow-right-to-bracket"></i> ${esc(r.cand.world)}</div>
+                  ${compare}
+                </div>
+              </div>`;
+        }).join('');
+        $list.html(html || '<div class="cslt-muted cslt-pad">검색 결과 없음</div>');
+        syncCount();
+    };
+    const syncCount = () => {
+        const n = rows.filter(r => r.checked).length;
+        setBtnLabel($foot.find('.cslt-apply'), `적용 ${n}`);
+        $foot.find('.cslt-apply').prop('disabled', n === 0);
+    };
+
+    $list.on('click', '.cslt-row', function (e) {
+        if ($(e.target).closest('details').length) return;
+        const i = Number($(this).data('i'));
+        const r = rows[i];
+        r.checked = e.target.type === 'checkbox' ? e.target.checked : !r.checked;
+        $(this).toggleClass('is-checked', r.checked).children('input').prop('checked', r.checked);
+        syncCount();
+    });
+    $tools.on('click', '.cslt-filter button', function () {
+        filter = String($(this).data('f'));
+        $tools.find('.cslt-filter button').removeClass('active');
+        $(this).addClass('active');
+        draw();
+    });
+    $tools.on('click', '[data-sel]', function () {
+        const on = $(this).data('sel') === 1;
+        for (const i of visible) rows[i].checked = on;
+        draw();
+    });
+    $search.on('input', debounce(draw, 120));
+    $foot.find('.cslt-back').on('click', onBack);
+    $foot.find('.cslt-apply').on('click', async () => {
+        const chosen = rows.filter(r => r.checked);
+        const over = chosen.filter(r => r.existing).length;
+        if (over && !confirm(`${chosen.length}개를 가져올게.\n그중 ${over}개는 기존 번역을 덮어써. 괜찮아?`)) return;
+        const $btn = $foot.find('.cslt-apply').prop('disabled', true);
+        setBtnLabel($btn, '적용 중...');
+        try {
+            await applyImport(target, chosen, $foot.find('.cslt-with-keys').is(':checked'));
+            $ov.remove();
+        } catch (err) {
+            console.error(`[${EXT_TAG}] import apply failed`, err);
+            toastr.error(`가져오기 실패: ${err?.message ?? err}`, EXT_NAME);
+            syncCount();
+        }
+    });
+    draw();
+}
+
+async function applyImport(world, chosen, withKeys) {
+    if (getCurrentWorldName() !== world) throw new Error('그새 로어북이 바뀌었어. 다시 열어줘');
+    const keyChanges = [];   // { uid, merged }
+    for (const r of chosen) {
+        const tr = r.cand.tr;
+        const k = makeKey(world, r.target.uid);
+        rtData.cache[k] = {
+            keys: Array.isArray(tr.keys) ? [...tr.keys] : undefined,
+            content: typeof tr.content === 'string' ? tr.content : undefined,
+            truncated: !!tr.truncated,
+            edited: !!tr.edited,
+            importedFrom: r.cand.world,
+            src: r.targetInfo,
+            savedAt: Date.now(),
+        };
+        if (withKeys && Array.isArray(tr.keys)) {
+            const originals = r.target.keys;   // 이미 우리 한글키 제거된 원래 키
+            const origSet = new Set(originals);
+            const newAdded = uniq(tr.keys.map(s => String(s).trim()).filter(x => x && !origSet.has(x)));
+            if (newAdded.length) rtData.addedKeys[k] = newAdded; else delete rtData.addedKeys[k];
+            keyChanges.push({ uid: r.target.uid, merged: [...originals, ...newAdded] });
+        }
+    }
+    flushWorld(world);
+
+    let keyNote = '';
+    if (keyChanges.length) {
+        const wi = await resolveWI();
+        if (wi.load && wi.save) {
+            const data = await wi.load(world);
+            let n = 0;
+            for (const { uid, merged } of keyChanges) {
+                const e = data?.entries?.[uid];
+                if (e) { e.key = merged; n++; }
+            }
+            await wi.save(world, data, true);
+            if (wi.reload) { try { wi.reload(world); } catch { /* noop */ } }
+            keyNote = ` · 키워드 ${n}개 반영`;
+        } else {
+            keyNote = ' · 키워드는 "저장" 버튼으로 반영해줘';
+        }
+    }
+
+    document.querySelectorAll('#world_popup .cslt-result-panel').forEach(el => el.remove());
+    await restoreCachedTranslations().catch(() => {});
+    updateDataSizeDisplay();
+    toastr.success(`${chosen.length}개 가져옴${keyNote}`, EXT_NAME, { timeOut: 4000 });
 }
 
 const scanAndInjectDebounced = debounce(() => {
@@ -1509,6 +2197,7 @@ function watchForWIPopup() {
 function onAppReady() {
     if (appReady) return;
     appReady = true;
+    loadFont();
     window.addEventListener('beforeunload', flushAllWorlds);
     $(document).on('click', '#world_popup_close, #WI-management-close', () => setTimeout(flushAllWorlds, 100));
     console.log(`[${EXT_TAG}] APP_READY received`);
