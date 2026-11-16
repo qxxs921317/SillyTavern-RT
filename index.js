@@ -1802,7 +1802,7 @@ function stripAdded(world, uid, keys) {
  * targets: [{uid, comment, keys, content}]  (한글 추가키 제거된 원래 키)
  * cands:   [{world, uid, tr, info, text, titleN, keySet}]
  */
-function matchEntries(targets, cands) {
+function matchEntries(targets, cands, selfWorld = '') {
     const byContent = new Map();
     const byTK = new Map();
     const byKey = new Map();
@@ -1822,12 +1822,17 @@ function matchEntries(targets, cands) {
     let unmatched = 0;
     for (const t of targets) {
         const ti = srcInfo(t.content, t.keys, t.comment);
+        // 같은 로어북에서 가져올 때 자기 자신과 매칭되는 건 제외
+        const isSelf = (c) => c.world === selfWorld && c.uid === t.uid;
+        const notSelf = (list) => (list || []).filter(c => !isSelf(c));
+        const sameBody = ti.c ? notSelf(byContent.get(ti.c)) : [];
+        const sameTK = ti.t && ti.k ? notSelf(byTK.get(`${ti.t}|${ti.k}`)) : [];
         let row = null;
-        if (ti.c && byContent.has(ti.c)) {
-            row = { type: 'exact', reason: '본문 일치', cand: newest(byContent.get(ti.c)) };
-        } else if (ti.t && ti.k && byTK.has(`${ti.t}|${ti.k}`)) {
+        if (sameBody.length) {
+            row = { type: 'exact', reason: '본문 일치', cand: newest(sameBody) };
+        } else if (sameTK.length) {
             // 여기까지 왔으면 본문은 다름 → 무조건 확인 필요
-            const cand = newest(byTK.get(`${ti.t}|${ti.k}`));
+            const cand = newest(sameTK);
             const tText = normText(t.content);
             let reason = '제목·키 일치 · 본문 다름';
             let score;
@@ -1847,6 +1852,7 @@ function matchEntries(targets, cands) {
                 let best = null, bestScore = 0;
                 const tb = bigrams(tText);
                 for (const c of pool) {
+                    if (isSelf(c)) continue;
                     const ratio = c.text.length / tText.length;
                     if (ratio < 0.5 || ratio > 2) continue;
                     c._bg ??= bigrams(c.text);
@@ -1885,7 +1891,7 @@ async function collectCandidates(sourceWorlds) {
                 keySet = new Set(keys.map(normText).filter(Boolean));
             }
             if (!info) { noInfo++; continue; }
-            cands.push({ world: src, uid, tr, info, text, titleN, keySet, origText: orig?.content || '' });
+            cands.push({ world: src, uid, tr, info, text, titleN, keySet, origText: orig?.content || '', origTitle: orig?.comment || '' });
         }
     }
     return { cands, noInfo };
@@ -1901,15 +1907,18 @@ async function openImportModal() {
     flushAllWorlds();
     await loadAllWorlds();
 
-    const sources = allWorldNames().filter(w => w !== target).map(w => {
+    const names = allWorldNames();
+    if (!names.includes(target)) names.push(target);
+    const sources = names.map(w => {
         const prefix = `${w}::`;
         let n = 0;
         for (const [k, v] of Object.entries(rtData.cache)) if (k.startsWith(prefix) && hasTranslation(v)) n++;
-        return { name: w, count: n, exists: worldExists(w) };
-    }).filter(s => s.count > 0).sort((a, b) => a.name.localeCompare(b.name));
+        return { name: w, count: n, exists: worldExists(w), self: w === target };
+    }).filter(s => s.count > 0)
+        .sort((a, b) => (b.self - a.self) || a.name.localeCompare(b.name));
 
     if (!sources.length) {
-        $body.html('<div class="cslt-empty"><i class="fa-solid fa-box-open"></i><div>가져올 번역이 있는 다른 로어북이 없어</div></div>');
+        $body.html('<div class="cslt-empty"><i class="fa-solid fa-box-open"></i><div>가져올 번역이 있는 로어북이 없어</div></div>');
         return;
     }
     renderImportStep1($ov, target, sources);
@@ -1933,7 +1942,8 @@ function renderImportStep1($ov, target, sources) {
           <label class="cslt-row cslt-row-src">
             <input type="checkbox" data-name="${esc(s.name)}" ${picked.has(s.name) ? 'checked' : ''}>
             <div class="cslt-row-main">
-              <div class="cslt-row-top"><span class="cslt-row-title">${esc(s.name)}</span>
+              <div class="cslt-row-top"><span class="cslt-row-title">${s.self ? '이 로어북' : esc(s.name)}</span>
+                ${s.self ? '<span class="cslt-tag cslt-tag-ok">같은 로어북 중복 항목</span>' : ''}
                 ${s.exists ? '' : '<span class="cslt-tag cslt-tag-warn" title="원본 로어북이 없어서 원문 지문이 있는 번역만 매칭돼">원본 없음</span>'}
               </div>
               <div class="cslt-row-sub">번역 ${s.count}개</div>
@@ -1972,7 +1982,10 @@ async function runImportMatch($ov, target, sourceWorlds, onBack) {
     if (!tEntries) throw new Error('현재 로어북 항목을 못 읽었어');
     const targets = tEntries.map(e => ({ ...e, keys: stripAdded(target, e.uid, e.keys) }));
     const { cands, noInfo } = await collectCandidates(sourceWorlds);
-    const { rows, unmatched } = matchEntries(targets, cands);
+    const matched = matchEntries(targets, cands, target);
+    // 같은 로어북끼리는 "번역 없는 항목 채우기"만 — 이미 번역된 항목끼리 서로 덮어쓰지 않게
+    const rows = matched.rows.filter(r => !(r.cand.world === target && hasTranslation(rtData.cache[makeKey(target, r.target.uid)])));
+    const unmatched = matched.unmatched;
 
     for (const r of rows) {
         const existing = rtData.cache[makeKey(target, r.target.uid)];
@@ -2044,7 +2057,7 @@ function renderImportStep2($ov, target, rows, stats, onBack) {
               <details class="cslt-compare"><summary>원문 비교</summary>
                 <div class="cslt-compare-grid">
                   <div><div class="cslt-cap">지금 로어북</div><div class="cslt-compare-text">${esc(r.target.content.slice(0, 600))}</div></div>
-                  <div><div class="cslt-cap">${esc(r.cand.world)}</div><div class="cslt-compare-text">${esc(r.cand.origText.slice(0, 600))}</div></div>
+                  <div><div class="cslt-cap">${r.cand.world === target ? esc(r.cand.origTitle || `#${r.cand.uid}`) : esc(r.cand.world)}</div><div class="cslt-compare-text">${esc(r.cand.origText.slice(0, 600))}</div></div>
                 </div>
               </details>` : '';
             return `
@@ -2057,7 +2070,7 @@ function renderImportStep2($ov, target, rows, stats, onBack) {
                     ${r.existing ? `<span class="cslt-tag cslt-tag-danger" title="이미 번역이 있어서 덮어써짐">${r.existing.edited ? '수정본 덮어씀' : '덮어씀'}</span>` : ''}
                   </div>
                   <div class="cslt-row-sub">${esc(r.snippet)}</div>
-                  <div class="cslt-row-src-name"><i class="fa-solid fa-arrow-right-to-bracket"></i> ${esc(r.cand.world)}</div>
+                  <div class="cslt-row-src-name"><i class="fa-solid fa-arrow-right-to-bracket"></i> ${r.cand.world === target ? `이 로어북 · ${esc(r.cand.origTitle || `#${r.cand.uid}`)}` : esc(r.cand.world)}</div>
                   ${compare}
                 </div>
               </div>`;
