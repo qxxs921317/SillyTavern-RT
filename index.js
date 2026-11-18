@@ -394,11 +394,121 @@ function flushWorld(world) {
         clearTimeout(st.timer);
         worldTimers.delete(world);
     }
-    persistWorld(world).catch(err => console.error(`[${EXT_TAG}] 저장 실패:`, err));
+    const p = persistWorld(world).catch(err => console.error(`[${EXT_TAG}] 저장 실패:`, err));
+    inflight.set(world, p);
+    p.finally(() => { if (inflight.get(world) === p) inflight.delete(world); });
 }
 
 function flushAllWorlds() {
     for (const world of [...worldTimers.keys()]) flushWorld(world);
+}
+
+/* ---------- 로어북 단위 이동/삭제 (이름 변경 대응, v0.10) ---------- */
+const inflight = new Map();   // world -> 진행 중인 저장 Promise
+
+async function deleteWorldFile(fileName) {
+    try {
+        const res = await fetch(FILE_DELETE_URL, {
+            method: 'POST',
+            headers: reqHeaders(),
+            body: JSON.stringify({ path: `${FILE_DIR}/${fileName}` }),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+/** 이 로어북 이름으로 된 번역 데이터를 흔적 없이 지움 (런타임 + 파일 + 인덱스 + 레거시) */
+async function purgeWorld(world) {
+    const st = worldTimers.get(world);
+    if (st) { clearTimeout(st.timer); worldTimers.delete(world); }
+    await inflight.get(world)?.catch(() => {});
+
+    const prefix = `${world}::`;
+    for (const section of ['cache', 'addedKeys']) {
+        for (const k of Object.keys(rtData[section])) if (k.startsWith(prefix)) delete rtData[section][k];
+    }
+    const settings = getSettings();
+    const idx = settings.fileIndex?.[world];
+    if (idx?.file && !storageFailed) await deleteWorldFile(idx.file);
+    if (settings.fileIndex) delete settings.fileIndex[world];
+    // 레거시 잔여분도 같이 — 안 지우면 다음에 다시 "주인 없는 번역"으로 살아남
+    const raw = extension_settings[EXT_ID] || {};
+    for (const section of ['cache', 'addedKeys']) {
+        for (const k of Object.keys(raw[section] || {})) if (k.startsWith(prefix)) delete raw[section][k];
+    }
+    loadedWorlds.delete(world);
+    saveSettingsDebounced();
+}
+
+function worldUids(world) {
+    const prefix = `${world}::`;
+    const uids = new Set();
+    for (const section of ['cache', 'addedKeys']) {
+        for (const k of Object.keys(rtData[section])) if (k.startsWith(prefix)) uids.add(k.slice(prefix.length));
+    }
+    return [...uids];
+}
+
+/**
+ * from 데이터를 to 로어북에 대 보기 — 같은 로어북인지 판단용
+ * uidHit: to에 같은 uid가 있는 수 / srcHit: 원문 지문까지 같은 수 / conflicts: to에 이미 번역 있는 수
+ */
+async function compareWorlds(from, to) {
+    await ensureWorld(from);
+    await ensureWorld(to);
+    const uids = worldUids(from);
+    const entries = await loadWorldEntries(to);
+    const map = new Map((entries || []).map(e => [e.uid, e]));
+    let uidHit = 0, srcHit = 0, srcTotal = 0, conflicts = 0, translations = 0;
+    for (const uid of uids) {
+        const e = map.get(uid);
+        if (e) uidHit++;
+        const tr = rtData.cache[makeKey(from, uid)];
+        if (hasTranslation(tr)) translations++;
+        if (tr?.src?.c) {
+            srcTotal++;
+            if (e && keyHash(normText(e.content)) === tr.src.c) srcHit++;
+        }
+        if (hasTranslation(rtData.cache[makeKey(to, uid)])) conflicts++;
+    }
+    return { total: uids.length, translations, uidHit, srcHit, srcTotal, conflicts, entries: entries?.length ?? 0 };
+}
+
+/**
+ * from → to 로 키 앞부분만 바꿔서 옮김 (uid 그대로)
+ * 수정본·한글키 기록·가져옴 표시까지 전부 유지
+ */
+async function migrateWorld(from, to, { overwrite = false } = {}) {
+    await ensureWorld(from);
+    await ensureWorld(to);
+    await inflight.get(from)?.catch(() => {});
+    const prefix = `${from}::`;
+    let moved = 0, skipped = 0;
+    for (const section of ['cache', 'addedKeys']) {
+        for (const [k, v] of Object.entries(rtData[section])) {
+            if (!k.startsWith(prefix)) continue;
+            const nk = makeKey(to, k.slice(prefix.length));
+            if (rtData[section][nk] === undefined || overwrite) {
+                rtData[section][nk] = structuredClone(v);
+                if (section === 'cache') moved++;
+            } else if (section === 'cache') skipped++;
+        }
+    }
+    // 새 쪽을 먼저 확실히 저장한 뒤에 옛 쪽을 지움
+    const st = worldTimers.get(to);
+    if (st) { clearTimeout(st.timer); worldTimers.delete(to); }
+    await persistWorld(to);
+    await purgeWorld(from);
+    return { moved, skipped };
+}
+
+/** 현재 열린 로어북의 패널 다시 그리기 */
+async function refreshPanels() {
+    document.querySelectorAll('#world_popup .cslt-result-panel').forEach(el => el.remove());
+    await restoreCachedTranslations().catch(() => {});
+    updateDataSizeDisplay?.();
 }
 
 async function persistWorld(world) {
@@ -1501,7 +1611,11 @@ async function restoreCachedTranslations() {
     if (!popup) return;
 
     const world = getCurrentWorldName();
-    if (lastWorld && lastWorld !== world) flushWorld(lastWorld);   // 다른 로어북으로 전환 → 즉시 저장
+    if (lastWorld && lastWorld !== world) {
+        flushWorld(lastWorld);   // 다른 로어북으로 전환 → 즉시 저장
+        const from = lastWorld;
+        checkRename(from, world).catch(err => console.warn(`[${EXT_TAG}] checkRename`, err));
+    }
     lastWorld = world;
 
     if (!loadedWorlds.has(world)) {
@@ -1897,12 +2011,17 @@ async function collectCandidates(sourceWorlds) {
     return { cands, noInfo };
 }
 
+function importBody($ov) {
+    const $t = $ov.find('.cslt-tab-body');
+    return $t.length ? $t : $ov.find('.cslt-modal-body');
+}
+
 async function openImportModal() {
     const target = getCurrentWorldName();
     if (!target || target === 'unknown') { toastr.warning('로어북을 먼저 열어줘', EXT_NAME); return; }
 
     const $ov = openModal({ id: 'cslt-import-overlay', title: '번역 가져오기', icon: 'fa-file-import', wide: true });
-    const $body = $ov.find('.cslt-modal-body').html('<div class="cslt-muted cslt-pad">번역 데이터 불러오는 중...</div>');
+    const $mb = $ov.find('.cslt-modal-body').html('<div class="cslt-muted cslt-pad">번역 데이터 불러오는 중...</div>');
 
     flushAllWorlds();
     await loadAllWorlds();
@@ -1916,17 +2035,38 @@ async function openImportModal() {
         return { name: w, count: n, exists: worldExists(w), self: w === target };
     }).filter(s => s.count > 0)
         .sort((a, b) => (b.self - a.self) || a.name.localeCompare(b.name));
+    const orphans = findOrphans();
 
-    if (!sources.length) {
-        $body.html('<div class="cslt-empty"><i class="fa-solid fa-box-open"></i><div>가져올 번역이 있는 로어북이 없어</div></div>');
-        return;
-    }
-    renderImportStep1($ov, target, sources);
+    $mb.empty().append(`
+      <div class="cslt-seg cslt-tabs">
+        <button type="button" data-tab="import" class="active"><i class="fa-solid fa-file-import"></i><span>로어북에서 가져오기</span></button>
+        <button type="button" data-tab="orphan"><i class="fa-solid fa-link-slash"></i><span>주인 없는 번역</span><b class="cslt-tab-count"></b></button>
+      </div>
+      <div class="cslt-tab-body"></div>`);
+    const setCount = (n) => $mb.find('.cslt-tab-count').text(n ? n : '').toggle(!!n);
+    setCount(orphans.length);
+
+    const showImport = () => {
+        if (!sources.length) {
+            importBody($ov).html('<div class="cslt-empty"><i class="fa-solid fa-box-open"></i><div>가져올 번역이 있는 로어북이 없어</div></div>');
+            return;
+        }
+        renderImportStep1($ov, target, sources);
+    };
+    $mb.find('.cslt-tabs').on('click', 'button', function () {
+        $mb.find('.cslt-tabs button').removeClass('active');
+        $(this).addClass('active');
+        if ($(this).data('tab') === 'orphan') renderOrphanTab($ov, target, orphans, setCount);
+        else showImport();
+    });
+    // 가져올 게 없고 주인 없는 번역만 있으면 그 탭부터
+    if (!sources.length && orphans.length) $mb.find('.cslt-tabs [data-tab="orphan"]').trigger('click');
+    else showImport();
 }
 
 function renderImportStep1($ov, target, sources) {
     const picked = new Set();
-    const $body = $ov.find('.cslt-modal-body').empty();
+    const $body = importBody($ov).empty();
     $body.append($('<div class="cslt-modal-sub">').html(`어느 로어북에서 가져올까? → <b>${esc(target)}</b>`));
     const $search = $('<input type="search" class="text_pole cslt-search" placeholder="로어북 이름 검색">').appendTo($body);
     const $list = $('<div class="cslt-list">').appendTo($body);
@@ -2000,7 +2140,7 @@ async function runImportMatch($ov, target, sourceWorlds, onBack) {
 }
 
 function renderImportStep2($ov, target, rows, stats, onBack) {
-    const $body = $ov.find('.cslt-modal-body').empty();
+    const $body = importBody($ov).empty();
     const nExact = rows.filter(r => r.type === 'exact').length;
     const nSimilar = rows.length - nExact;
     const nExisting = rows.filter(r => r.existing).length;
@@ -2172,6 +2312,196 @@ async function applyImport(world, chosen, withKeys) {
     toastr.success(`${chosen.length}개 가져옴${keyNote}`, EXT_NAME, { timeOut: 4000 });
 }
 
+/* ===================================================================
+ * 이름 변경 감지 (v0.10)
+ *  - ST의 "이름 변경" 버튼을 누르는 순간 지금 이름을 기억
+ *  - 그 뒤 에디터가 새 이름으로 바뀌고 옛 이름이 목록에서 사라지면 → 확인 받고 옮김
+ *  - 놓친 경우는 가져오기 → "주인 없는 번역" 탭에서 처리
+ * =================================================================== */
+let renameHint = null;   // { from, at }
+const RENAME_BTN_SEL = '#world_popup_name_button, #world_popup [title="Rename World Info"], #world_popup [data-i18n*="Rename World Info"]';
+
+function installRenameWatcher() {
+    document.addEventListener('click', (e) => {
+        if (!(e.target instanceof Element) || !e.target.closest(RENAME_BTN_SEL)) return;
+        const from = getCurrentWorldName();
+        if (from && from !== 'unknown') renameHint = { from, at: Date.now() };
+    }, true);
+}
+
+async function checkRename(from, to) {
+    if (!renameHint || renameHint.from !== from || Date.now() - renameHint.at > 180000) return;
+    renameHint = null;
+
+    // ST가 목록을 갱신할 때까지 잠깐 기다림
+    for (let i = 0; i < 15 && worldExists(from); i++) await sleep(200);
+    if (worldExists(from)) return;   // 옛 이름이 남아 있음 → 이름 변경 아님
+
+    await ensureWorld(from);
+    const stats = await compareWorlds(from, to);
+    if (!stats.total) return;
+
+    const lines = [
+        '로어북 이름이 바뀐 것 같아',
+        `${from}  →  ${to}`,
+        '',
+        `번역 ${stats.translations}개 · uid 일치 ${stats.uidHit}/${stats.total}` + (stats.srcTotal ? ` · 원문 일치 ${stats.srcHit}/${stats.srcTotal}` : ''),
+    ];
+    if (stats.conflicts) lines.push(`(새 이름 쪽에 이미 번역 ${stats.conflicts}개 있음 — 그건 안 덮어씀)`);
+    lines.push('', '새 이름으로 옮길까?');
+    if (!confirm(lines.join('\n'))) {
+        toastr.info('나중에 가져오기 → "주인 없는 번역" 탭에서 옮길 수 있어', EXT_NAME, { timeOut: 5000 });
+        return;
+    }
+    try {
+        const { moved, skipped } = await migrateWorld(from, to);
+        if (getCurrentWorldName() === to) await refreshPanels();
+        toastr.success(`번역 ${moved}개 옮김${skipped ? ` (겹쳐서 건너뜀 ${skipped})` : ''}`, EXT_NAME, { timeOut: 4000 });
+    } catch (err) {
+        console.error(`[${EXT_TAG}] rename migrate failed`, err);
+        toastr.error(`옮기기 실패: ${err?.message ?? err}`, EXT_NAME);
+    }
+}
+
+/* ===================================================================
+ * 주인 없는 번역 탭 (v0.10)
+ * =================================================================== */
+function existingWorldNames() {
+    const out = [];
+    document.querySelectorAll('#world_editor_select option').forEach(o => {
+        const name = o.textContent?.trim();
+        if (o.value !== '' && name) out.push(name);
+    });
+    return out;
+}
+
+function countWorld(world) {
+    const prefix = `${world}::`;
+    let n = 0, keysOnly = 0;
+    for (const [k, v] of Object.entries(rtData.cache)) if (k.startsWith(prefix) && hasTranslation(v)) n++;
+    for (const k of Object.keys(rtData.addedKeys)) if (k.startsWith(prefix) && !rtData.cache[k]) keysOnly++;
+    return { n, keysOnly };
+}
+
+function findOrphans() {
+    const existing = existingWorldNames();
+    if (!existing.length) return [];   // 목록을 못 읽으면 전부 주인 없음으로 보이니까 아예 안 띄움
+    const set = new Set(existing);
+    return allWorldNames().filter(w => !set.has(w)).map(w => {
+        const { n, keysOnly } = countWorld(w);
+        return { name: w, count: n, keysOnly, updatedAt: getSettings().fileIndex?.[w]?.updatedAt || 0 };
+    }).filter(o => o.count + o.keysOnly > 0).sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function fmtDate(ts) {
+    if (!ts) return '';
+    const d = new Date(ts);
+    const p = (x) => String(x).padStart(2, '0');
+    return `${d.getFullYear()}.${p(d.getMonth() + 1)}.${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderOrphanTab($ov, target, orphans, onCountChange) {
+    const $body = importBody($ov).empty();
+    if (!orphans.length) {
+        $body.html('<div class="cslt-empty"><i class="fa-solid fa-circle-check"></i><div>주인 없는 번역이 없어</div></div>');
+        return;
+    }
+    $body.append('<div class="cslt-modal-sub">로어북 이름이 바뀌었거나 지워져서 연결이 끊긴 번역이야. 원래 로어북에 다시 연결하면 수정본까지 그대로 돌아와.</div>');
+    const $list = $('<div class="cslt-list cslt-list-tall">').appendTo($body);
+    const worlds = existingWorldNames();
+
+    const draw = () => {
+        $list.html(orphans.map((o, i) => `
+          <div class="cslt-orphan" data-i="${i}">
+            <div class="cslt-orphan-head">
+              <div class="cslt-row-main">
+                <div class="cslt-row-top"><span class="cslt-row-title">${esc(o.name)}</span></div>
+                <div class="cslt-row-sub">번역 ${o.count}개${o.keysOnly ? ` · 한글키 기록 ${o.keysOnly}개` : ''}${o.updatedAt ? ` · ${fmtDate(o.updatedAt)}` : ''}</div>
+              </div>
+              <div class="cslt-orphan-btns">
+                <button type="button" class="cslt-btn cslt-btn-primary cslt-o-link"><i class="fa-solid fa-link"></i><span>연결</span></button>
+                <button type="button" class="cslt-act cslt-act-danger cslt-o-del" title="이 번역 데이터 삭제"><i class="fa-solid fa-trash-can"></i></button>
+              </div>
+            </div>
+            <div class="cslt-orphan-link" hidden>
+              <div class="cslt-orphan-row">
+                <span class="cslt-muted">연결할 로어북</span>
+                <select class="text_pole cslt-o-target">
+                  ${worlds.map(w => `<option value="${esc(w)}" ${w === target ? 'selected' : ''}>${esc(w)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="cslt-o-stats cslt-muted">확인 중...</div>
+              <div class="cslt-orphan-row cslt-orphan-foot">
+                <label class="checkbox_label cslt-opt cslt-o-over-wrap" hidden><input type="checkbox" class="cslt-o-over"><span>겹치는 번역 덮어쓰기</span></label>
+                <button type="button" class="cslt-btn cslt-btn-primary cslt-o-go"><i class="fa-solid fa-check"></i><span>옮기기</span></button>
+              </div>
+            </div>
+          </div>`).join(''));
+    };
+
+    const showStats = async ($o, o) => {
+        const to = String($o.find('.cslt-o-target').val());
+        const $s = $o.find('.cslt-o-stats').text('확인 중...');
+        const st = await compareWorlds(o.name, to);
+        const pct = st.total ? Math.round((st.uidHit / st.total) * 100) : 0;
+        const good = pct >= 90 && (!st.srcTotal || st.srcHit / st.srcTotal >= 0.8);
+        $s.html(`
+          <span class="cslt-tag ${good ? 'cslt-tag-ok' : 'cslt-tag-warn'}">${good ? '같은 로어북 같아' : '확인 필요'}</span>
+          uid 일치 <b>${st.uidHit}/${st.total}</b>${st.srcTotal ? ` · 원문 일치 <b>${st.srcHit}/${st.srcTotal}</b>` : ''}${st.conflicts ? ` · 이미 번역 있음 <b>${st.conflicts}</b>` : ''}`);
+        $o.find('.cslt-o-over-wrap').prop('hidden', !st.conflicts);
+        $o.data('stats', st);
+    };
+
+    $list.on('click', '.cslt-o-link', function () {
+        const $o = $(this).closest('.cslt-orphan');
+        const $l = $o.find('.cslt-orphan-link');
+        const open = $l.prop('hidden');
+        $l.prop('hidden', !open);
+        if (open) showStats($o, orphans[Number($o.data('i'))]);
+    });
+    $list.on('change', '.cslt-o-target', function () {
+        const $o = $(this).closest('.cslt-orphan');
+        showStats($o, orphans[Number($o.data('i'))]);
+    });
+    $list.on('click', '.cslt-o-go', async function () {
+        const $o = $(this).closest('.cslt-orphan');
+        const i = Number($o.data('i'));
+        const o = orphans[i];
+        const to = String($o.find('.cslt-o-target').val());
+        const st = $o.data('stats');
+        if (st && st.total && st.uidHit / st.total < 0.5
+            && !confirm(`uid가 ${st.uidHit}/${st.total}개만 맞아. 다른 로어북일 수도 있어.\n그래도 옮길까?`)) return;
+        const $btn = $(this).prop('disabled', true);
+        setBtnLabel($btn, '옮기는 중...');
+        try {
+            const { moved, skipped } = await migrateWorld(o.name, to, { overwrite: $o.find('.cslt-o-over').is(':checked') });
+            toastr.success(`${o.name} → ${to}: 번역 ${moved}개 옮김${skipped ? ` (겹쳐서 건너뜀 ${skipped})` : ''}`, EXT_NAME, { timeOut: 4000 });
+            orphans.splice(i, 1);
+            onCountChange(orphans.length);
+            if (getCurrentWorldName() === to) await refreshPanels();
+            renderOrphanTab($ov, target, orphans, onCountChange);
+        } catch (err) {
+            console.error(`[${EXT_TAG}] orphan migrate failed`, err);
+            toastr.error(`옮기기 실패: ${err?.message ?? err}`, EXT_NAME);
+            setBtnLabel($btn, '옮기기');
+            $btn.prop('disabled', false);
+        }
+    });
+    $list.on('click', '.cslt-o-del', async function () {
+        const $o = $(this).closest('.cslt-orphan');
+        const i = Number($o.data('i'));
+        const o = orphans[i];
+        if (!confirm(`"${o.name}"의 번역 ${o.count}개를 완전히 삭제할까?\n(되돌릴 수 없어 — 필요하면 설정에서 먼저 내보내기)`)) return;
+        await purgeWorld(o.name);
+        orphans.splice(i, 1);
+        onCountChange(orphans.length);
+        updateDataSizeDisplay?.();
+        toastr.success('삭제됨', EXT_NAME, { timeOut: 2000 });
+        renderOrphanTab($ov, target, orphans, onCountChange);
+    });
+    draw();
+}
+
 const scanAndInjectDebounced = debounce(() => {
     if (!appReady) return;
     try {
@@ -2211,6 +2541,7 @@ function onAppReady() {
     if (appReady) return;
     appReady = true;
     loadFont();
+    installRenameWatcher();
     window.addEventListener('beforeunload', flushAllWorlds);
     $(document).on('click', '#world_popup_close, #WI-management-close', () => setTimeout(flushAllWorlds, 100));
     console.log(`[${EXT_TAG}] APP_READY received`);
